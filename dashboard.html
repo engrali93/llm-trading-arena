@@ -170,8 +170,8 @@
       <h2>Past lives <span id="lcount"></span></h2>
       <div class="tablewrap" style="max-height:260px">
         <table>
-          <thead><tr><th>#</th><th>Started</th><th>Start cash</th><th>Fee</th><th>Turns</th><th>Final value</th><th>Status</th><th>Export</th></tr></thead>
-          <tbody id="lives"><tr><td colspan="8" class="empty">No lives yet</td></tr></tbody>
+          <thead><tr><th>#</th><th>Model</th><th>Started</th><th>Start cash</th><th>Fee</th><th>Turns</th><th>Final value</th><th>Status</th><th>Export</th></tr></thead>
+          <tbody id="lives"><tr><td colspan="9" class="empty">No lives yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -444,11 +444,11 @@ function renderLives(runs) {
   $('#lcount').textContent = `${runs.length} total`;
   $('#lives').innerHTML = runs.length ? runs.map(r => {
     const pl = (r.final_value / r.start_cash - 1) * 100;
-    return `<tr><td>${r.id}</td><td>${tfmt(r.started)}</td><td>${money(r.start_cash)}</td><td>${Number(r.fee_pct).toFixed(2)}%</td>
+    return `<tr><td>${r.id}</td><td>${esc(r.model || '')}</td><td>${tfmt(r.started)}</td><td>${money(r.start_cash)}</td><td>${Number(r.fee_pct).toFixed(2)}%</td>
       <td>${r.turns}</td><td>${money(r.final_value)} <span class="${signCls(pl)}">(${pl >= 0 ? '+' : ''}${pl.toFixed(1)}%)</span></td>
       <td><span class="badge ${esc(r.status)}">${esc(r.status.toUpperCase())}</span></td>
       <td><a class="lnk" href="/api/report?run=${r.id}" target="_blank" rel="noopener" aria-label="Report for life ${r.id}">Report</a><a class="lnk" href="/api/export.zip?run=${r.id}" download aria-label="CSV data for life ${r.id}">CSV</a></td></tr>`;
-  }).join('') : '<tr><td colspan="8" class="empty">No lives yet</td></tr>';
+  }).join('') : '<tr><td colspan="9" class="empty">No lives yet</td></tr>';
 }
 
 async function refresh() {

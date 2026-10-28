@@ -30,7 +30,7 @@ No exchange account, no API keys and no paid services are needed. Everything run
 | Starting cash | `$50` (1 to 100000) |
 | Fee per buy and per sell | `0.10%` (0 to 5) |
 | Death line | total value below `$1` |
-| Model | `deepseek-r1:8b` (or `deepseek-r1:1.5b` on weak hardware) |
+| Model | `deepseek-r1:14b` (`deepseek-r1:8b` on 8 GB GPUs, `deepseek-r1:1.5b` on weaker hardware) |
 | Turn interval | `120` s, timed start to start |
 | Minimum 24h volume to buy | `$50,000,000` |
 
@@ -39,9 +39,11 @@ No exchange account, no API keys and no paid services are needed. Everything run
 1. **Python 3.9+.** Check with `python --version` (`python3` on Mac/Linux). Install from python.org, `winget install Python.Python.3.12`, or `brew install python`. Use the **standard library only**: no pip installs.
 2. **Ollama.** Check with `ollama --version` and that `http://localhost:11434/api/tags` responds. Install from ollama.com if missing.
 3. **Pick the model by hardware.**
-   - NVIDIA GPU with 8 GB+ VRAM, or Apple Silicon with 16 GB+ -> `ollama pull deepseek-r1:8b`
-   - Otherwise -> `ollama pull deepseek-r1:1.5b`
+   - 12 GB+ VRAM (or Apple Silicon with 24 GB+) -> `ollama pull deepseek-r1:14b`
+   - 8 GB VRAM (or Apple Silicon with 16 GB) -> `ollama pull deepseek-r1:8b`
+   - Less -> `ollama pull deepseek-r1:1.5b`
    - Test it: `ollama run <model> "reply with OK"`
+   - **12 GB cards and the 14b are tight** (about 10 GB at a 12288 context). Set `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` in the environment of the Ollama server and restart it (check its log for `OLLAMA_FLASH_ATTENTION:true`). After the first real turn run `ollama ps`: PROCESSOR must say `100% GPU`. If part runs on the CPU, close GPU-hungry apps or lower `num_ctx` step by step (12288, 10240, 8192); other programs' VRAM use (browsers, chat apps) is part of the budget.
 4. Any Ollama model works. Non-reasoning models (e.g. `llama3.1:8b`) are faster and follow JSON more reliably, but they won't produce a reasoning trace for the dashboard.
 
 ## Step 2: Architecture (follow these rules)
@@ -118,7 +120,7 @@ positions(bot_id, symbol, qty, avg_cost, last_price, PRIMARY KEY(bot_id, symbol)
 trades(id, bot_id, ts, turn, action, symbol, qty, price, usd, fee, cash_after, qty_after, reason)
 equity(id, bot_id, ts, btc_price, cash, positions_value, equity)      -- one row per turn
 decisions(id, bot_id, ts, turn, action, orders, watch, reason, note, error,
-          prompt_tokens, eval_tokens, thinking, duration)
+          prompt_tokens, eval_tokens, thinking, duration, stage2)
 news(id, link UNIQUE, title, source, published, tags, fetched)
 ```
 Migrations: when an older single-life ledger has no `start_cash` column on `bots`, rebuild the table (SQLite can't drop its `UNIQUE(name)`), turn the existing row into life #1, and read its start cash back from its first `equity` row. Add new columns with `ALTER TABLE` and never wipe a ledger unless the user passes `--reset`.
@@ -160,13 +162,15 @@ Migrations: when an older single-life ledger has no `start_cash` column on `bots
 
 R1 distills love to overthink: 4,000 to 9,000+ tokens per turn, sometimes never reaching an answer. `think: false` is ignored by some builds. What works (Ollama accepts `format` and `think: true` together):
 
-1. **Context:** set `num_ctx` to at least the prompt plus the reasoning budget (8192 works for a ~4k prompt and a 2000-token budget). An overflowing context makes the model forget its instructions.
+1. **Context:** set `num_ctx` to at least the prompt plus the reasoning budget (about 6k tokens for a ~3k prompt and a 2000-token budget; 8192 is enough, 12288 gave the 14b headroom and still fit a 12 GB GPU at 100% GPU). Make it a flag. An overflowing context makes the model forget its instructions.
 2. **Stage 1:** `/api/chat` with `think: true`, `format` = the schema, `temperature` 0.7, and `num_predict` = the reasoning budget (default 2000, flag `--think-budget`). Reasoning arrives in `message.thinking`, the answer in `message.content`. If `content` has valid JSON, you're done.
 3. **Stage 2 (the usual case for 8B):** if there is no content, call `/api/generate` with `raw: true`, a prompt in the model's chat template ending with the reasoning so far inside a closed think block (`<think>...reasoning...</think>`), and the same schema as `format`. The schema forces a valid JSON answer. (DeepSeek-R1 template: begin-of-sentence token, system text, `<｜User｜>` user text, `<｜Assistant｜><think>`...)
 4. Strip any `<think>...</think>` from the content as a fallback and take the **last** valid JSON object (scan balanced braces; a simple `{[^{}]*}` regex fails on nested orders).
 5. Retry once. After that, hold and log the error.
 6. Save the trimmed thinking (about 1500 characters) per decision for the dashboard. It's the most entertaining part.
-7. `--think-budget 0` skips the reasoning phase entirely (an empty think block plus the schema): fastest, least interesting.
+7. **Measure the fallback.** Record per turn whether stage 2 was needed (`decisions.stage2`). In a 5-turn test the 8b needed it on every turn and often produced invalid orders (invented symbols, all-in buys), while the 14b finished its reasoning inside the budget on 4 of 5 turns, averaged about 33 s per turn after the first model load (about 51 s for the 8b), and made no invalid-symbol mistakes. Bigger is better here if it fits.
+8. **One model per life.** Store the model name on each life and show it in Past lives. If the arena is started with a different model than the current life's, archive that life and start a new one with the same settings; if the life has no turns yet, just switch it in place. Never mix two models inside one life, or the comparison is meaningless.
+9. `--think-budget 0` skips the reasoning phase entirely (an empty think block plus the schema): fastest, least interesting.
 
 ## Step 4: Verify (don't skip)
 

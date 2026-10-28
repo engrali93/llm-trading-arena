@@ -5,7 +5,7 @@ An autonomous LLM trader (via Ollama) that may pick any coin from the Binance to
 with free news + sentiment as hints. Fake money, SQLite ledger, live dashboard.
 No exchange account, no API keys. Python standard library only.
 
-    python arena.py --model deepseek-r1:8b      -> http://localhost:8001
+    python arena.py --model deepseek-r1:14b     -> http://localhost:8001
 """
 import argparse
 import collections
@@ -150,7 +150,7 @@ def init_db(path):
     con = connect(path)
     con.executescript(SCHEMA)
     have = {r["name"] for r in con.execute("PRAGMA table_info(decisions)")}
-    for col, typ in (("thinking", "TEXT"), ("duration", "REAL")):      # migrate older ledgers in place
+    for col, typ in (("thinking", "TEXT"), ("duration", "REAL"), ("stage2", "INTEGER")):   # migrate older ledgers in place
         if col not in have:
             con.execute(f"ALTER TABLE decisions ADD COLUMN {col} {typ}")
     if "last_price" not in {r["name"] for r in con.execute("PRAGMA table_info(positions)")}:
@@ -611,9 +611,9 @@ def trim_thinking(th, limit=1500):
 
 
 def ask_ollama(cfg, system, user):
-    """Returns (reply_text, thinking, prompt_tokens, eval_tokens).
+    """Returns (reply_text, thinking, prompt_tokens, eval_tokens, used_stage2).
     Stage 1: /api/chat with a JSON-schema `format` and think=true; R1's reasoning arrives in message.thinking.
-    An 8B R1 often rambles past any sane token budget before answering, so if stage 1 ends without content,
+    R1 distills often ramble past any sane token budget before answering, so if stage 1 ends without content,
     stage 2 feeds the reasoning so far back (raw prompt, think block closed) with the same schema `format`,
     which forces a valid JSON answer."""
     ptok = etok = 0
@@ -622,20 +622,20 @@ def ask_ollama(cfg, system, user):
         d = _post(cfg.host, "/api/chat", {
             "model": cfg.model, "stream": False, "think": True, "format": REPLY_SCHEMA,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "options": {"temperature": 0.7, "num_predict": cfg.think_budget, "num_ctx": 8192}})
+            "options": {"temperature": 0.7, "num_predict": cfg.think_budget, "num_ctx": cfg.num_ctx}})
         msg = d["message"]
         content, thinking = msg.get("content") or "", msg.get("thinking") or ""
         ptok, etok = d.get("prompt_eval_count") or 0, d.get("eval_count") or 0
         if content.strip():
-            return content, trim_thinking(thinking), ptok, etok
+            return content, trim_thinking(thinking), ptok, etok, False
     closing = "\n\nI have thought enough. Time to decide and answer.\n" if thinking.strip() else ""
     prompt = (f"<｜begin▁of▁sentence｜>{system}<｜User｜>{user}"
               f"<｜Assistant｜><think>\n{thinking.strip()}{closing}</think>\n\n")
     d = _post(cfg.host, "/api/generate", {
         "model": cfg.model, "stream": False, "raw": True, "prompt": prompt, "format": REPLY_SCHEMA,
-        "options": {"temperature": 0.5, "num_predict": 600, "num_ctx": 8192}})
+        "options": {"temperature": 0.5, "num_predict": 600, "num_ctx": cfg.num_ctx}})
     return (d["response"], trim_thinking(thinking), ptok + (d.get("prompt_eval_count") or 0),
-            etok + (d.get("eval_count") or 0))
+            etok + (d.get("eval_count") or 0), True)
 
 
 def json_objects(text):
@@ -823,6 +823,17 @@ def run_sim(cfg, market, mood):
                     (bot["id"], now_iso(), market.btc, bot["cash"], 0.0, bot["cash"]))
         con.commit()
     cfg.start_cash, cfg.fee_rate = bot["start_cash"], bot["fee_rate"]      # the active life's own rules
+    model_now = "mock (random)" if cfg.mock else cfg.model
+    if bot["model"] != model_now:                                          # one model per life, never mixed
+        if bot["ticks"] == 0:
+            con.execute("UPDATE bots SET model=? WHERE id=?", (model_now, bot["id"]))
+            con.commit()
+            bot["model"] = model_now
+        else:
+            print(f"Model changed ({bot['model']} -> {model_now}): archiving life #{bot['id']} and starting a new one "
+                  f"with the same settings.", flush=True)
+            with RESTART_LOCK:
+                RESTART_REQ["req"] = {"start_cash": cfg.start_cash, "fee_pct": round(cfg.fee_rate * 100, 4)}
     announced_death = False
     news_ts = 0.0
 
@@ -862,7 +873,7 @@ def run_sim(cfg, market, mood):
         except Exception:
             watch = []
 
-        error, ptok, etok, thinking = None, None, None, ""
+        error, ptok, etok, thinking, stage2 = None, None, None, "", 0
         try:
             if cfg.mock:
                 d = mock_decide(market, positions, bot["cash"])
@@ -870,8 +881,8 @@ def run_sim(cfg, market, mood):
                 prompt = turn_prompt(con, cfg, market, mood, bot, turn, positions, watch)
                 ptok = etok = 0
                 for attempt in (1, 2):                              # one retry if the reply has no JSON
-                    raw, thinking, p_, e_ = ask_ollama(cfg, system, prompt)
-                    ptok, etok = ptok + p_, etok + e_
+                    raw, thinking, p_, e_, s2_ = ask_ollama(cfg, system, prompt)
+                    ptok, etok, stage2 = ptok + p_, etok + e_, stage2 + int(s2_)
                     try:
                         d = parse_action(raw)
                         break
@@ -915,9 +926,9 @@ def run_sim(cfg, market, mood):
             + (f" ${o['usd']}" if o.get("usd") else "") + (f" {o['sell_pct']}%" if o.get("sell_pct") else "")
             for o in orders[:3] if isinstance(o, dict)) or "none"
         con.execute("INSERT INTO decisions(bot_id, ts, turn, action, orders, watch, reason, note, error,"
-                    " prompt_tokens, eval_tokens, thinking, duration) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " prompt_tokens, eval_tokens, thinking, duration, stage2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (bot["id"], ts, turn, "trade" if trades else "hold", summary, json.dumps(new_watch),
-                     reason, note, error, ptok, etok, thinking, time.time() - t0))
+                     reason, note, error, ptok, etok, thinking, time.time() - t0, stage2))
         con.execute("INSERT INTO equity(bot_id, ts, btc_price, cash, positions_value, equity) VALUES(?,?,?,?,?,?)",
                     (bot["id"], ts, market.btc, cash, pos_val, eq))
         save_positions(con, bot["id"], positions, prices)
@@ -926,7 +937,7 @@ def run_sim(cfg, market, mood):
         con.commit()
 
         tr = " ".join(f"{t['action']} {base_of(t['symbol'])} ${t['usd']:.2f}" for t in trades) or "HOLD"
-        tok = f" | tok {ptok}+{etok}" if ptok else ""
+        tok = (f" | tok {ptok}+{etok}" if ptok else "") + (" | stage2" if stage2 else "")
         print(f"turn {turn:>4} | {time.time() - t0:5.1f}s | value ${eq:8.2f} | cash ${cash:7.2f} | {len(positions)} coins | {tr}{tok}"
               f" | {reason[:60]}" + (f"  [!] {error[:80]}" if error else ""), flush=True)
 
@@ -1533,7 +1544,8 @@ def check_ollama(host, model):
 # ───────────────────────── main ─────────────────────────
 def main():
     ap = argparse.ArgumentParser(description="Autonomous multi-coin LLM trader with a fake ledger and live dashboard")
-    ap.add_argument("--model", default="deepseek-r1:8b", help="Ollama model name")
+    ap.add_argument("--model", default="deepseek-r1:14b",
+                    help="Ollama model name. A life never mixes models: starting with a different one archives the current life and begins a new one")
     ap.add_argument("--name", dest="bot_name", default="DeepSeek", help="label for the bot")
     ap.add_argument("--cash", dest="start_cash", type=float, default=50.0,
                     help="starting cash in $ (only seeds a brand-new ledger; later changes come from the dashboard)")
@@ -1553,6 +1565,8 @@ def main():
                     help="listen on all interfaces (phone/other PCs) and accept restarts from them; default is 127.0.0.1 only")
     ap.add_argument("--db", default="arena.db", help="SQLite ledger file (relative to this script)")
     ap.add_argument("--reset", action="store_true", help="wipe the ledger and start a new life")
+    ap.add_argument("--num-ctx", type=int, default=12288,
+                    help="Ollama context window in tokens. Must hold the prompt plus the reasoning budget (about 6k is enough). 12288 keeps the 14b fully on a 12 GB GPU; if `ollama ps` shows CPU, lower it to 10240 or 8192")
     ap.add_argument("--think-budget", type=int, default=2000,
                     help="max reasoning tokens before the answer is forced into the JSON schema (0 = skip reasoning)")
     ap.add_argument("--csv-delimiter", choices=["auto", "comma", "semicolon"], default="auto",

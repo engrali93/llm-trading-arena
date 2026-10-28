@@ -75,10 +75,20 @@ Install from [ollama.com/download](https://ollama.com/download). On Linux: `curl
 
 | Hardware | Model |
 |---|---|
-| NVIDIA GPU with 8 GB+ VRAM, or Apple Silicon with 16 GB+ | `ollama pull deepseek-r1:8b` (default) |
+| NVIDIA GPU with 12 GB+ VRAM, or Apple Silicon with 24 GB+ | `ollama pull deepseek-r1:14b` (default) |
+| 8 GB VRAM (or Apple Silicon with 16 GB) | `ollama pull deepseek-r1:8b` and run with `--model deepseek-r1:8b` |
 | Anything weaker | `ollama pull deepseek-r1:1.5b` and run with `--model deepseek-r1:1.5b` |
 
 Any Ollama model works, e.g. `--model qwen3:8b` or `--model llama3.1:8b`.
+
+**12 GB GPUs and the 14b:** the 14b takes about 10 GB with a 12288-token context, which is tight on a 12 GB card, so set these two Ollama environment variables and restart Ollama. The start scripts export them when they launch Ollama themselves, but if the Ollama app starts on its own you need them in your user environment:
+
+| Variable | Value |
+|---|---|
+| `OLLAMA_FLASH_ATTENTION` | `1` |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` |
+
+On Windows: `setx OLLAMA_FLASH_ATTENTION 1` and `setx OLLAMA_KV_CACHE_TYPE q8_0`, then quit and reopen Ollama. After the first turn, run `ollama ps`: the PROCESSOR column should say `100% GPU`. If part of the model is on the CPU, close GPU-hungry apps (browsers, video calls) or lower `--num-ctx` to 10240, then 8192.
 
 ## Running
 
@@ -101,7 +111,7 @@ The **Settings** panel has:
 - **Fee (%):** 0 to 5 (default 0.10), charged on every buy and every sell
 - **Restart agent:** after an in-page confirmation, the current life is archived and a new one starts with these settings. The restart takes effect as soon as the turn in progress finishes.
 
-Each life is kept in the ledger and listed under **Past lives** (start cash, fee, turns survived, final value, running / ended / died). The active settings are saved in SQLite, so they survive restarting `arena.py`. The `--cash` and `--fee` flags only seed a brand-new ledger.
+Each life is kept in the ledger and listed under **Past lives** (model, start cash, fee, turns survived, final value, running / ended / died). A life uses one model for its whole run, so starting the arena with a different `--model` archives the current life and starts a new one. The active settings are saved in SQLite, so they survive restarting `arena.py`. The `--cash` and `--fee` flags only seed a brand-new ledger.
 
 Restarts are accepted only from the same machine unless `--lan` is set, only as same-origin `application/json` requests, and the values are validated server-side.
 
@@ -120,7 +130,8 @@ CSV details: UTF-8 with a byte-order mark, so Excel shows umlauts and emoji corr
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--model` | `deepseek-r1:8b` | Ollama model name |
+| `--model` | `deepseek-r1:14b` | Ollama model name. A life never mixes models: starting with a different one archives the current life and begins a new one with the same settings |
+| `--num-ctx` | `12288` | Ollama context window in tokens. About 6k is enough for the prompt plus reasoning; 12288 keeps the 14b fully on a 12 GB GPU. Lower it if `ollama ps` shows CPU |
 | `--interval` | `120` | Seconds from the start of one turn to the start of the next. A slower turn starts the next one immediately |
 | `--cash` | `50` | Starting cash. Only seeds a brand-new ledger |
 | `--fee` | `0.10` | Fee in percent on every buy and sell. Only seeds a brand-new ledger |
@@ -167,7 +178,8 @@ R1-style models think out loud before answering, and an 8B distill often rambles
 
 Other notes:
 
-- `num_ctx` is set to 8192. Ollama's default context is too small for this prompt, and an overflowing context makes the model lose its instructions.
+- `num_ctx` is set explicitly (`--num-ctx`, default 12288). Ollama's default context size can be huge and run out of memory, and a context that is too small makes the model lose its instructions.
+- The 14b usually finishes its reasoning within `--think-budget`, so the stage-2 fallback is rare. The 8b needed it on almost every turn. In a small test (5 turns each) the 14b averaged about 33 s per turn after loading, against about 51 s for the 8b, and made fewer invalid orders.
 - `think: false` is ignored by some R1 builds, which is why the arena doesn't rely on it.
 - If a reply still doesn't parse, the arena retries once, then holds and logs the error.
 - The trimmed reasoning (about 1500 characters) is saved with each decision and shown on the dashboard.
