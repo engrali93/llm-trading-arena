@@ -97,6 +97,17 @@ Each life is kept in the ledger and listed under **Past lives** (start cash, fee
 
 Restarts are accepted only from the same machine unless `--lan` is set, only as same-origin `application/json` requests, and the values are validated server-side.
 
+## Exports
+
+Every life, running, ended or dead, can be exported without touching the running agent (exports are read-only and nothing is saved to disk):
+
+- **Export report** (dashboard header, and a "Report" link per life under Past lives) opens `GET /api/report?run=<life id>` in a new tab: a printable A4 summary with the settings, outcome (alive or dead, turns, duration, final value, P/L, versus BTC buy and hold), statistics (trades, fees, win rate on closed trades, best and worst trade, max drawdown, peak value, most-traded coins), an SVG chart that prints without JavaScript, the final holdings, the five biggest per-turn swings with the agent's reason, its last 10 notes, and the full trade table. Use the **Print / Save as PDF** button.
+- **Export data (CSV)** (and a "CSV" link per life) downloads `GET /api/export.zip?run=<life id>`, a ZIP built in memory named `arena_life<id>_<YYYYMMDD-HHMM>.zip` with `trades.csv`, `equity.csv`, `decisions.csv` (including the reasoning text), `positions.csv`, `news.csv` (headlines from that life's time range) and `summary.json` (the same statistics as the report).
+
+Without `run=`, the current life is exported. Like restarts, exports are only served to the same machine unless you start with `--lan`.
+
+CSV details: UTF-8 with a byte-order mark, so Excel shows umlauts and emoji correctly, and ISO timestamps. `--csv-delimiter auto` (the default) follows your regional settings: if your system uses a decimal comma, the CSVs use `;` as the column separator and decimal commas, which is what Excel expects there; otherwise they use `,` and decimal points. Force a style with `--csv-delimiter comma` or `semicolon`, or per request with `&sep=comma` / `&sep=semicolon`. Text that starts with `=`, `+`, `-` or `@` gets a leading `'` so a spreadsheet never runs it as a formula.
+
 ## Command-line flags
 
 | Flag | Default | What it does |
@@ -112,6 +123,7 @@ Restarts are accepted only from the same machine unless `--lan` is set, only as 
 | `--port` | `8001` | Dashboard port |
 | `--lan` | off | Listen on all interfaces and accept restarts from the network |
 | `--db` | `arena.db` | SQLite ledger file, relative to the script folder |
+| `--csv-delimiter` | `auto` | CSV export style: `auto` (follows your regional number format), `comma` or `semicolon` |
 | `--name` | `DeepSeek` | Label shown for the bot |
 | `--host` | `http://localhost:11434` | Ollama URL |
 | `--think-budget` | `2000` | Max reasoning tokens before the answer is forced into the JSON schema (0 skips reasoning) |
@@ -168,7 +180,7 @@ LICENSE           MIT
 arena.db          your ledger (created on first run, git-ignored)
 ```
 
-HTTP endpoints: `GET /` (dashboard), `GET /api/state`, `GET /api/runs`, `POST /api/restart`.
+HTTP endpoints: `GET /` (dashboard), `GET /api/state`, `GET /api/runs`, `POST /api/restart`, `GET /api/report?run=<id>`, `GET /api/export.zip?run=<id>`.
 
 ## Build your own
 

@@ -8,7 +8,11 @@ No exchange account, no API keys. Python standard library only.
     python arena.py --model deepseek-r1:8b      -> http://localhost:8001
 """
 import argparse
+import collections
+import csv
 import email.utils
+import html
+import io
 import json
 import math
 import os
@@ -21,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -148,6 +153,8 @@ def init_db(path):
     for col, typ in (("thinking", "TEXT"), ("duration", "REAL")):      # migrate older ledgers in place
         if col not in have:
             con.execute(f"ALTER TABLE decisions ADD COLUMN {col} {typ}")
+    if "last_price" not in {r["name"] for r in con.execute("PRAGMA table_info(positions)")}:
+        con.execute("ALTER TABLE positions ADD COLUMN last_price REAL")     # lets exports value a finished life's holdings
     cols = {r["name"] for r in con.execute("PRAGMA table_info(bots)")}
     if not cols:                                                       # brand-new ledger
         con.execute(BOTS_DDL)
@@ -221,6 +228,9 @@ def apply_pending_restart(con, cfg, market, bot):
     pos = load_positions(con, bot["id"])
     final = total_value(bot["cash"], pos, market.prices)
     con.execute("UPDATE bots SET ended=?, final_value=? WHERE id=?", (now_iso(), final, bot["id"]))
+    for sym in pos:                                     # remember the prices the final holdings were valued at
+        con.execute("UPDATE positions SET last_price=? WHERE bot_id=? AND symbol=?",
+                    (market.prices.get(sym), bot["id"], sym))
     cfg.start_cash, cfg.fee_pct = req["start_cash"], req["fee_pct"]
     cfg.fee_rate = cfg.fee_pct / 100
     set_setting(con, "start_cash", cfg.start_cash)
@@ -242,10 +252,10 @@ def load_positions(con, bot_id):
         "SELECT symbol, qty, avg_cost FROM positions WHERE bot_id=? AND qty>0", (bot_id,))}
 
 
-def save_positions(con, bot_id, positions):
+def save_positions(con, bot_id, positions, prices):
     con.execute("DELETE FROM positions WHERE bot_id=?", (bot_id,))
-    con.executemany("INSERT INTO positions(bot_id, symbol, qty, avg_cost) VALUES(?,?,?,?)",
-                    [(bot_id, s, p["qty"], p["avg"]) for s, p in positions.items() if p["qty"] > 0])
+    con.executemany("INSERT INTO positions(bot_id, symbol, qty, avg_cost, last_price) VALUES(?,?,?,?,?)",
+                    [(bot_id, s, p["qty"], p["avg"], prices.get(s)) for s, p in positions.items() if p["qty"] > 0])
 
 
 # ───────────────────────── markets ─────────────────────────
@@ -910,7 +920,7 @@ def run_sim(cfg, market, mood):
                      reason, note, error, ptok, etok, thinking, time.time() - t0))
         con.execute("INSERT INTO equity(bot_id, ts, btc_price, cash, positions_value, equity) VALUES(?,?,?,?,?,?)",
                     (bot["id"], ts, market.btc, cash, pos_val, eq))
-        save_positions(con, bot["id"], positions)
+        save_positions(con, bot["id"], positions, prices)
         con.execute("UPDATE bots SET cash=?, alive=?, ticks=?, died=?, final_value=? WHERE id=?",
                     (cash, alive, turn, None if alive else ts, eq, bot["id"]))
         con.commit()
@@ -924,6 +934,408 @@ def run_sim(cfg, market, mood):
 
 
 # ───────────────────────── dashboard server ─────────────────────────
+def open_readonly(cfg):
+    con = connect(cfg.db)
+    con.execute("PRAGMA query_only=ON")             # exports can never write, so they can't disturb the agent
+    return con
+
+
+def parse_ts(iso):
+    try:
+        return datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_when(iso):
+    d = parse_ts(iso)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if d else "-"
+
+
+def fmt_duration(seconds):
+    s = int(max(0, seconds))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    return (f"{d}d " if d else "") + f"{h}h {s // 60}m"
+
+
+def replay_closed_trades(trades):
+    """Rebuild average cost per coin from the trade log and score every SELL: net profit after the sell fee
+    versus the average cost of the coins sold."""
+    pos, closed = {}, []
+    for t in trades:
+        p = pos.setdefault(t["symbol"], [0.0, 0.0])                 # [qty, avg cost incl. buy fees]
+        if t["action"] == "BUY":
+            p[1] = (p[0] * p[1] + t["usd"] + t["fee"]) / (p[0] + t["qty"]) if p[0] + t["qty"] > 0 else 0.0
+            p[0] += t["qty"]
+        elif p[1] > 0:
+            cost = t["qty"] * p[1]
+            pnl = t["usd"] - t["fee"] - cost
+            closed.append({"symbol": t["symbol"], "turn": t["turn"], "ts": t["ts"], "price": t["price"],
+                           "avg_cost": p[1], "pnl_usd": pnl, "pnl_pct": pnl / cost * 100 if cost else 0.0})
+            p[0] = max(0.0, p[0] - t["qty"])
+    return closed
+
+
+def life_stats(con, cfg, market, bot_id):
+    """Everything the report and summary.json show for one life. Returns None for an unknown life."""
+    row = con.execute("SELECT * FROM bots WHERE id=?", (bot_id,)).fetchone()
+    if not row:
+        return None
+    bot = dict(row)
+    cur = current_bot(con)
+    live = bool(cur) and cur["id"] == bot["id"] and bool(bot["alive"]) and not bot["ended"]
+    equity = [dict(r) for r in con.execute(
+        "SELECT ts, btc_price, cash, positions_value, equity FROM equity WHERE bot_id=? ORDER BY id", (bot_id,))]
+    trades = [dict(r) for r in con.execute("SELECT * FROM trades WHERE bot_id=? ORDER BY id", (bot_id,))]
+    decisions = [dict(r) for r in con.execute("SELECT * FROM decisions WHERE bot_id=? ORDER BY id", (bot_id,))]
+
+    holdings = []
+    for r in con.execute("SELECT symbol, qty, avg_cost, last_price FROM positions WHERE bot_id=? AND qty>0", (bot_id,)):
+        price = (market.prices.get(r["symbol"]) if live else None) or r["last_price"]
+        at_cost = price is None                                      # old ledgers didn't store the closing price
+        price = price if price is not None else r["avg_cost"]
+        holdings.append({"symbol": r["symbol"], "qty": r["qty"], "avg_cost": r["avg_cost"], "price": price,
+                         "value": r["qty"] * price, "pl_pct": (price / r["avg_cost"] - 1) * 100 if r["avg_cost"] else 0.0,
+                         "valued_at_cost": at_cost})
+    holdings.sort(key=lambda h: -h["value"])
+
+    start_cash = bot["start_cash"]
+    if live:
+        final = bot["cash"] + sum(h["value"] for h in holdings)
+    elif bot["final_value"] is not None:
+        final = bot["final_value"]
+    else:
+        final = equity[-1]["equity"] if equity else start_cash
+    end_iso = bot["ended"] or bot["died"]
+    t_start, t_end = parse_ts(bot["started"]), parse_ts(end_iso) or datetime.now(timezone.utc)
+    duration = (t_end - t_start).total_seconds() if t_start else 0.0
+    status = "DEAD" if not bot["alive"] else ("ALIVE" if live else "ENDED")
+
+    btc0 = next((e["btc_price"] for e in equity if e["btc_price"]), None)
+    btc1 = (market.btc if live else None) or next((e["btc_price"] for e in reversed(equity) if e["btc_price"]), None)
+    btc = None
+    if btc0 and btc1:
+        btc = {"start_price": btc0, "end_price": btc1, "value": start_cash * btc1 / btc0, "pl_pct": (btc1 / btc0 - 1) * 100}
+    pl_pct = (final / start_cash - 1) * 100 if start_cash else 0.0
+
+    peak, max_dd, max_dd_usd, peak_value = 0.0, 0.0, 0.0, start_cash
+    for e in equity:
+        v = e["equity"]
+        peak = max(peak, v)
+        peak_value = max(peak_value, v)
+        if peak > 0 and (peak - v) / peak > max_dd:
+            max_dd, max_dd_usd = (peak - v) / peak, peak - v
+
+    closed = replay_closed_trades(trades)
+    wins = [c for c in closed if c["pnl_usd"] > 0]
+    by_coin = collections.defaultdict(lambda: [0, 0.0])
+    for t in trades:
+        by_coin[t["symbol"]][0] += 1
+        by_coin[t["symbol"]][1] += t["usd"]
+    top_coins = [{"symbol": s, "trades": n, "volume_usd": v}
+                 for s, (n, v) in sorted(by_coin.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))[:5]]
+
+    by_ts = {d["ts"]: d for d in decisions}
+    moments = []
+    for prev, e in zip(equity, equity[1:]):
+        d = by_ts.get(e["ts"], {})
+        delta = e["equity"] - prev["equity"]
+        moments.append({"turn": d.get("turn"), "ts": e["ts"], "change_usd": delta,
+                        "change_pct": delta / prev["equity"] * 100 if prev["equity"] else 0.0,
+                        "orders": d.get("orders") or "", "reason": d.get("reason") or ""})
+    moments = sorted(moments, key=lambda m: -abs(m["change_usd"]))[:5]
+    notes = [{"turn": d["turn"], "ts": d["ts"], "note": d["note"]} for d in reversed(decisions) if d["note"]][:10]
+
+    summary = {
+        "generated": now_iso(), "life_id": bot["id"], "bot_name": bot["name"], "model": bot["model"], "status": status,
+        "started": bot["started"], "ended": bot["ended"], "died": bot["died"],
+        "turns": bot["ticks"], "duration_seconds": round(duration),
+        "settings": {"start_cash": start_cash, "fee_pct": (bot["fee_rate"] or 0) * 100, "death_line": cfg.death_line,
+                     "interval_seconds": cfg.interval, "min_volume_usd": cfg.min_volume},
+        "final_value": final, "pl_usd": final - start_cash, "pl_pct": pl_pct,
+        "btc_buy_and_hold": btc, "vs_btc_pct_points": pl_pct - btc["pl_pct"] if btc else None,
+        "trades": {"count": len(trades), "buys": sum(t["action"] == "BUY" for t in trades),
+                   "sells": sum(t["action"] == "SELL" for t in trades),
+                   "fees_paid": sum(t["fee"] for t in trades), "volume_usd": sum(t["usd"] for t in trades)},
+        "closed_trades": {"count": len(closed), "wins": len(wins), "losses": len(closed) - len(wins),
+                          "win_rate_pct": len(wins) / len(closed) * 100 if closed else None,
+                          "best": max(closed, key=lambda c: c["pnl_usd"]) if closed else None,
+                          "worst": min(closed, key=lambda c: c["pnl_usd"]) if closed else None},
+        "drawdown": {"peak_value": peak_value, "max_drawdown_pct": max_dd * 100, "max_drawdown_usd": max_dd_usd},
+        "top_coins": top_coins, "holdings": holdings, "key_moments": moments, "last_notes": notes,
+    }
+    return {"summary": summary, "bot": bot, "equity": equity, "trades": trades, "decisions": decisions, "live": live,
+            "end_iso": end_iso or now_iso()}
+
+
+def svg_chart(equity, start_cash):
+    """Total value vs the start line vs BTC buy and hold, as a self-contained SVG (prints without JS or a CDN).
+    Line styles differ (solid, dashed, dotted) so it still reads in black and white."""
+    W, H, L, R, T, B = 720, 250, 62, 14, 26, 30
+    if len(equity) > 400:
+        step = math.ceil(len(equity) / 400)
+        equity = equity[::step] + ([equity[-1]] if (len(equity) - 1) % step else [])
+    times = [(parse_ts(e["ts"]) or datetime.now(timezone.utc)).timestamp() for e in equity] or [0.0]
+    btc0 = next((e["btc_price"] for e in equity if e["btc_price"]), None)
+    eq = [e["equity"] for e in equity] or [start_cash]
+    bh = [start_cash * e["btc_price"] / btc0 if btc0 and e["btc_price"] else None for e in equity]
+    vals = eq + [v for v in bh if v is not None] + [start_cash]
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * 0.08 or max(1.0, hi * 0.02)
+    lo, hi = lo - pad, hi + pad
+    t0, t1 = min(times), max(times)
+    span = (t1 - t0) or 1.0
+    X = lambda t: L + (t - t0) / span * (W - L - R) if t1 > t0 else L + (W - L - R) / 2
+    Y = lambda v: T + (hi - v) / (hi - lo) * (H - T - B)
+
+    def line(series, style):
+        pts = " ".join(f"{X(t):.1f},{Y(v):.1f}" for t, v in zip(times, series) if v is not None)
+        return f'<polyline fill="none" points="{pts}" {style}/>' if pts.count(",") > 1 else (
+            f'<circle cx="{pts.split(",")[0]}" cy="{pts.split(",")[1]}" r="2.5" fill="#222"/>' if pts else "")
+
+    out = [f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" role="img" '
+           f'aria-label="Total value over time compared with the start line and BTC buy and hold" font-family="Arial, sans-serif" font-size="10">']
+    for i in range(5):
+        v = lo + (hi - lo) * i / 4
+        out.append(f'<line x1="{L}" x2="{W - R}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="#e3e3e3"/>'
+                   f'<text x="{L - 6}" y="{Y(v) + 3:.1f}" text-anchor="end" fill="#555">${v:,.2f}</text>')
+    out.append(f'<text x="{L}" y="{H - 10}" fill="#555">{html.escape(fmt_when(equity[0]["ts"]) if equity else "")}</text>'
+               f'<text x="{W - R}" y="{H - 10}" text-anchor="end" fill="#555">{html.escape(fmt_when(equity[-1]["ts"]) if equity else "")}</text>')
+    out.append(line([start_cash] * len(times), 'stroke="#777" stroke-width="1.2" stroke-dasharray="2 4"'))
+    out.append(line(bh, 'stroke="#c77700" stroke-width="1.6" stroke-dasharray="7 4"'))
+    out.append(line(eq, 'stroke="#2f2fb8" stroke-width="2.2"'))
+    lx = L
+    for label, dash, color, w in (("Total value", "", "#2f2fb8", 2.2), ("BTC buy &amp; hold", "7 4", "#c77700", 1.6),
+                                  ("Start amount", "2 4", "#777", 1.2)):
+        out.append(f'<line x1="{lx}" x2="{lx + 22}" y1="12" y2="12" stroke="{color}" stroke-width="{w}"'
+                   + (f' stroke-dasharray="{dash}"' if dash else "") + f'/><text x="{lx + 27}" y="15" fill="#222">{label}</text>')
+        lx += 130
+    out.append("</svg>")
+    return "".join(out)
+
+
+REPORT_CSS = """
+@page { size: A4; margin: 14mm 12mm; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #fff; color: #111; font: 10pt/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+.page { max-width: 190mm; margin: 0 auto; padding: 10mm 0 14mm; }
+h1 { font-size: 20pt; margin: 0 0 1mm; }
+h2 { font-size: 12pt; margin: 7mm 0 2.5mm; padding-bottom: 1mm; border-bottom: 1px solid #888; page-break-after: avoid; break-after: avoid; }
+.sub { color: #555; font-size: 9pt; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3mm; }
+.box { border: 1px solid #bbb; border-radius: 2mm; padding: 2.2mm 3mm; page-break-inside: avoid; break-inside: avoid; }
+.box .k { font-size: 8pt; color: #555; }
+.box .v { font-size: 13pt; font-weight: 700; }
+.box .s { font-size: 8pt; color: #555; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 8pt; }
+th, td { border-bottom: 1px solid #ddd; padding: 1.2mm 1.5mm; text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
+th { background: #f0f0f0; font-weight: 600; }
+thead { display: table-header-group; }
+tr { page-break-inside: avoid; break-inside: avoid; }
+.r { text-align: right; }
+.pos { color: #0a6b35; } .neg { color: #b42318; }
+svg { width: 100%; height: auto; display: block; page-break-inside: avoid; break-inside: avoid; }
+.bar { display: flex; gap: 3mm; align-items: center; justify-content: space-between; margin-bottom: 5mm; }
+.btn { font: inherit; font-weight: 600; padding: 2mm 4mm; border: 1px solid #444; background: #fff; border-radius: 2mm; cursor: pointer; }
+.break { page-break-before: always; break-before: page; }
+.note { margin: 1mm 0; }
+.disclaimer { margin-top: 8mm; padding-top: 3mm; border-top: 1px solid #888; font-size: 8.5pt; color: #444; page-break-inside: avoid; break-inside: avoid; }
+@media screen and (max-width: 640px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+@media print { .no-print { display: none !important; } body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } .page { padding: 0; } }
+"""
+
+
+def render_report(S):
+    s, e = S["summary"], html.escape
+    money = lambda x: ("-" if x < 0 else "") + f"${abs(x):,.2f}"
+    signed = lambda x: ("+" if x >= 0 else "-") + f"${abs(x):,.2f}"
+    cls = lambda x: "pos" if x >= 0 else "neg"
+    st = s["settings"]
+    when_end = s["died"] if s["status"] == "DEAD" else s["ended"]
+    status_line = {"ALIVE": "ALIVE (still running)", "DEAD": f"DEAD at {fmt_when(s['died'])}",
+                   "ENDED": f"ENDED (restarted) at {fmt_when(s['ended'])}"}[s["status"]]
+    btc, tr, ct, dd = s["btc_buy_and_hold"], s["trades"], s["closed_trades"], s["drawdown"]
+
+    def box(k, v, sub=""):
+        return f'<div class="box"><div class="k">{e(k)}</div><div class="v">{v}</div><div class="s">{sub}</div></div>'
+
+    def trade_line(c):
+        if not c:
+            return "n/a"
+        return (f'{e(base_of(c["symbol"]))}, turn {c["turn"]}: <span class="{cls(c["pnl_usd"])}">{signed(c["pnl_usd"])} '
+                f'({c["pnl_pct"]:+.1f}%)</span>')
+
+    out = [f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+           f'<title>{e(s["bot_name"])} - Life #{s["life_id"]} report</title><style>{REPORT_CSS}</style></head><body><div class="page">',
+           '<div class="bar no-print"><span class="sub">Use your browser\'s print dialog: paper size A4, margins default.</span>'
+           '<button class="btn" type="button" onclick="window.print()">Print / Save as PDF</button></div>',
+           f'<h1>{e(s["bot_name"])} — Life #{s["life_id"]} report</h1>',
+           f'<div class="sub">Model: {e(str(s["model"]))} &middot; generated {e(fmt_when(s["generated"]))}</div>']
+
+    out.append("<h2>Settings</h2><div class=\"grid\">"
+               + box("Starting cash", money(st["start_cash"])) + box("Fee (every buy and sell)", f'{st["fee_pct"]:.2f}%')
+               + box("Death line", money(st["death_line"]), "dies if total value falls below")
+               + box("Turn interval", f'{st["interval_seconds"]:g} s', "arena setting at export time")
+               + box("Minimum 24h volume to buy", money(st["min_volume_usd"]).replace(".00", ""), "arena setting at export time")
+               + "</div>")
+
+    out.append("<h2>Outcome</h2><div class=\"grid\">"
+               + box("Status", e(status_line))
+               + box("Turns survived", str(s["turns"]), f'over {e(fmt_duration(s["duration_seconds"]))}')
+               + box("Final value", money(s["final_value"]))
+               + box("Profit / loss", f'<span class="{cls(s["pl_usd"])}">{signed(s["pl_usd"])}</span>',
+                     f'<span class="{cls(s["pl_pct"])}">{s["pl_pct"]:+.2f}%</span> vs start')
+               + (box("BTC buy & hold", f'<span class="{cls(btc["pl_pct"])}">{btc["pl_pct"]:+.2f}%</span>',
+                      f'{money(btc["value"])} from the same start cash')
+                  if btc else box("BTC buy & hold", "n/a", "no BTC price recorded"))
+               + (box("Versus BTC", f'<span class="{cls(s["vs_btc_pct_points"])}">{s["vs_btc_pct_points"]:+.2f} pts</span>',
+                      "agent minus BTC, same period") if btc else box("Versus BTC", "n/a"))
+               + "</div>")
+
+    wr = f'{ct["win_rate_pct"]:.0f}% ({ct["wins"]} of {ct["count"]})' if ct["count"] else "n/a (no closed trades)"
+    coins = ", ".join(f'{e(base_of(c["symbol"]))} ({c["trades"]})' for c in s["top_coins"]) or "none"
+    out.append("<h2>Statistics</h2><div class=\"grid\">"
+               + box("Trades", str(tr["count"]), f'{tr["buys"]} buys, {tr["sells"]} sells')
+               + box("Fees paid", money(tr["fees_paid"]), f'on {money(tr["volume_usd"])} traded')
+               + box("Win rate (closed trades)", wr, "sell proceeds after fee vs average cost")
+               + box("Best trade", trade_line(ct["best"]))
+               + box("Worst trade", trade_line(ct["worst"]))
+               + box("Peak value", money(dd["peak_value"]))
+               + box("Max drawdown", f'{dd["max_drawdown_pct"]:.1f}%', f'{money(dd["max_drawdown_usd"])} from a peak')
+               + box("Most-traded coins", coins)
+               + "</div>")
+
+    out.append("<h2>Total value over time</h2>" + svg_chart(S["equity"], st["start_cash"]))
+
+    out.append("<h2>Final holdings</h2>")
+    if s["holdings"]:
+        out.append('<table><colgroup><col style="width:16%"><col style="width:20%"><col style="width:16%"><col style="width:16%">'
+                   '<col style="width:16%"><col style="width:16%"></colgroup><thead><tr><th>Coin</th><th class="r">Qty</th>'
+                   '<th class="r">Avg cost</th><th class="r">Price</th><th class="r">Value</th><th class="r">P/L</th></tr></thead><tbody>')
+        for h in s["holdings"]:
+            out.append(f'<tr><td>{e(base_of(h["symbol"]))}</td><td class="r">{h["qty"]:.6g}</td><td class="r">{fmt_price(h["avg_cost"])}</td>'
+                       f'<td class="r">{fmt_price(h["price"])}{"*" if h["valued_at_cost"] else ""}</td><td class="r">{money(h["value"])}</td>'
+                       f'<td class="r {cls(h["pl_pct"])}">{h["pl_pct"]:+.1f}%</td></tr>')
+        out.append("</tbody></table>")
+        if any(h["valued_at_cost"] for h in s["holdings"]):
+            out.append('<div class="sub">* closing price was not recorded for this life, so the holding is shown at cost.</div>')
+        out.append(f'<div class="sub">Cash: {money(S["bot"]["cash"])}</div>')
+    else:
+        out.append(f'<div class="sub">No coins held. Cash: {money(S["bot"]["cash"])}</div>')
+
+    out.append("<h2>Key moments</h2>")
+    if s["key_moments"]:
+        out.append('<table><colgroup><col style="width:7%"><col style="width:17%"><col style="width:14%"><col style="width:62%"></colgroup>'
+                   '<thead><tr><th>Turn</th><th>Time</th><th class="r">Change</th><th>Orders and the agent\'s reason</th></tr></thead><tbody>')
+        for m in s["key_moments"]:
+            out.append(f'<tr><td>{m["turn"] if m["turn"] is not None else "?"}</td><td>{e(fmt_when(m["ts"]))}</td>'
+                       f'<td class="r {cls(m["change_usd"])}">{signed(m["change_usd"])}<br>{m["change_pct"]:+.2f}%</td>'
+                       f'<td>{("<b>" + e(m["orders"]) + "</b><br>") if m["orders"] and m["orders"] != "none" else ""}{e(m["reason"])}</td></tr>')
+        out.append("</tbody></table><div class=\"sub\">The 5 biggest per-turn swings in total value (market moves count, not only trades).</div>")
+    else:
+        out.append('<div class="sub">No turns recorded yet.</div>')
+
+    out.append("<h2>Last notes to self</h2>")
+    out.append("".join(f'<div class="note"><b>Turn {n["turn"]}:</b> {e(n["note"])}</div>' for n in s["last_notes"])
+               or '<div class="sub">The agent wrote no notes.</div>')
+
+    out.append('<div class="break"></div><h2>All trades</h2>')
+    if S["trades"]:
+        out.append('<table><colgroup><col style="width:15%"><col style="width:5%"><col style="width:8%"><col style="width:7%">'
+                   '<col style="width:11%"><col style="width:10%"><col style="width:9%"><col style="width:7%"><col style="width:28%"></colgroup>'
+                   '<thead><tr><th>Time</th><th>Turn</th><th>Coin</th><th>Action</th><th class="r">Qty</th><th class="r">Price</th>'
+                   '<th class="r">Value</th><th class="r">Fee</th><th>Reason</th></tr></thead><tbody>')
+        for t in S["trades"]:
+            d = parse_ts(t["ts"])
+            out.append(f'<tr><td>{e(d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M") if d else "-")}</td><td>{t["turn"]}</td>'
+                       f'<td>{e(base_of(t["symbol"]))}</td><td><b>{e(t["action"])}</b></td><td class="r">{t["qty"]:.6g}</td>'
+                       f'<td class="r">{fmt_price(t["price"])}</td><td class="r">{money(t["usd"])}</td><td class="r">{money(t["fee"])}</td>'
+                       f'<td>{e(t["reason"] or "")}</td></tr>')
+        out.append("</tbody></table>")
+    else:
+        out.append('<div class="sub">No trades in this life.</div>')
+
+    out.append('<div class="disclaimer"><b>Disclaimer.</b> This is a simulation. No real money was used and no real orders were placed. '
+               'Nothing here is financial advice, and the results say nothing about how a real strategy would perform.</div>')
+    out.append("</div></body></html>")
+    return "".join(out).encode("utf-8")
+
+
+def safe_cell(v):
+    """Stop spreadsheet formula injection: model- and feed-written text starting with = + - @ gets a leading quote."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+DECIMAL_COMMA_LANGS = {"de", "fr", "es", "it", "pt", "nl", "ru", "pl", "sv", "da", "fi", "nb", "no", "tr", "cs", "sk",
+                       "hu", "ro", "bg", "hr", "sl", "el", "uk", "id", "vi"}
+
+
+def system_decimal_separator():
+    """The decimal separator of the user's regional settings (Excel derives its CSV delimiter from it)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            buf = ctypes.create_unicode_buffer(8)
+            if ctypes.windll.kernel32.GetLocaleInfoEx(None, 0x0E, buf, 8):      # LOCALE_SDECIMAL, user default locale
+                return buf.value
+        else:
+            lang = os.environ.get("LC_NUMERIC") or os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
+            return "," if lang[:2].lower() in DECIMAL_COMMA_LANGS else "."
+    except Exception:
+        pass
+    return "."
+
+
+def csv_bytes(header, rows, delim=","):
+    """UTF-8 with a BOM. With delim=';' floats use a decimal comma, which is what Excel expects when the
+    system's decimal separator is a comma (it then also splits columns on ';' instead of ',')."""
+    def cell(v):
+        v = safe_cell(v)
+        return str(v).replace(".", ",") if delim == ";" and isinstance(v, float) else v
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=delim)
+    w.writerow(header)
+    for r in rows:
+        w.writerow([cell(v) for v in r])
+    return ("﻿" + buf.getvalue()).encode("utf-8")           # BOM so Excel reads umlauts and emojis as UTF-8
+
+
+def build_export_zip(con, S, delim=","):
+    s, bot_id = S["summary"], S["bot"]["id"]
+    csv_b = lambda header, rows: csv_bytes(header, rows, delim)
+    files = {
+        "trades.csv": csv_b(
+            ["id", "ts", "turn", "action", "symbol", "qty", "price", "usd", "fee", "cash_after", "qty_after", "reason"],
+            [[t["id"], t["ts"], t["turn"], t["action"], t["symbol"], t["qty"], t["price"], t["usd"], t["fee"],
+              t["cash_after"], t["qty_after"], t["reason"]] for t in S["trades"]]),
+        "equity.csv": csv_b(
+            ["ts", "btc_price", "cash", "positions_value", "equity"],
+            [[q["ts"], q["btc_price"], q["cash"], q["positions_value"], q["equity"]] for q in S["equity"]]),
+        "decisions.csv": csv_b(
+            ["ts", "turn", "action", "orders", "watch", "reason", "note", "error", "thinking",
+             "prompt_tokens", "eval_tokens", "duration_seconds"],
+            [[d["ts"], d["turn"], d["action"], d["orders"], d["watch"], d["reason"], d["note"], d["error"], d["thinking"],
+              d["prompt_tokens"], d["eval_tokens"], d["duration"]] for d in S["decisions"]]),
+        "positions.csv": csv_b(
+            ["symbol", "qty", "avg_cost", "price", "value", "pl_pct", "valued_at_cost"],
+            [[h["symbol"], h["qty"], h["avg_cost"], h["price"], h["value"], h["pl_pct"], h["valued_at_cost"]]
+             for h in s["holdings"]]),
+        "news.csv": csv_b(
+            ["published", "source", "title", "link", "tags"],
+            [[n["published"], n["source"], n["title"], n["link"], n["tags"]] for n in con.execute(
+                "SELECT published, source, title, link, tags FROM news WHERE published>=? AND published<=? ORDER BY published",
+                (S["bot"]["started"], S["end_iso"]))]),
+        "summary.json": json.dumps(s, indent=2, ensure_ascii=False).encode("utf-8"),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    name = f"arena_life{bot_id}_{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.zip"
+    return name, buf.getvalue()
+
+
 def build_runs(cfg, market):
     """Every life, newest first: start cash, fee, turns, final value and whether it died or was ended."""
     con = connect(cfg.db)
@@ -1009,8 +1421,49 @@ def make_handler(cfg, market, mood):
                     self._send(200, json.dumps(build_runs(cfg, market)).encode(), "application/json")
                 except Exception as e:
                     self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+            elif path in ("/api/report", "/api/export.zip"):
+                self._export(path)
             else:
                 self._send(404, b"not found", "text/plain")
+
+        def _local_error(self):
+            """Same access rule as restart: loopback only (and a sane Host header) unless --lan is set."""
+            if cfg.lan:
+                return None
+            if self.client_address[0] not in LOOPBACK:
+                return "only accepted from localhost (start with --lan to allow your network)"
+            if (urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname or "") not in ("localhost", "127.0.0.1", "::1"):
+                return "unexpected Host header"
+            return None
+
+        def _export(self, path):
+            err = self._local_error()
+            if err:
+                return self._json(403, {"error": "exports are " + err})
+            run = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("run", [None])[0]
+            con = open_readonly(cfg)
+            try:
+                if run is None:
+                    cur = current_bot(con)
+                    bot_id = cur["id"] if cur else None
+                else:
+                    try:
+                        bot_id = int(run)
+                    except ValueError:
+                        return self._json(400, {"error": "run must be a life number"})
+                S = life_stats(con, cfg, market, bot_id) if bot_id is not None else None
+                if not S:
+                    return self._json(404, {"error": "no such life"})
+                if path == "/api/report":
+                    return self._send(200, render_report(S), "text/html; charset=utf-8")
+                sep = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("sep", [None])[0]
+                delim = {"comma": ",", "semicolon": ";"}.get(sep, cfg.csv_sep)
+                name, data = build_export_zip(con, S, delim)
+                self._send(200, data, "application/zip", {"Content-Disposition": f'attachment; filename="{name}"'})
+            except Exception as e:
+                self._json(500, {"error": f"export failed: {e}"})
+            finally:
+                con.close()
 
         def _json(self, code, obj):
             self._send(code, json.dumps(obj).encode(), "application/json")
@@ -1019,11 +1472,9 @@ def make_handler(cfg, market, mood):
             if self.path.split("?")[0] != "/api/restart":
                 return self._json(404, {"error": "not found"})
             # Same-origin, JSON-only, localhost-only (unless --lan): a random web page can't trigger a restart.
-            if not cfg.lan and self.client_address[0] not in LOOPBACK:
-                return self._json(403, {"error": "restart is only accepted from localhost (start with --lan to allow your network)"})
-            host = urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname or ""
-            if not cfg.lan and host not in ("localhost", "127.0.0.1", "::1"):
-                return self._json(403, {"error": "unexpected Host header"})
+            err = self._local_error()
+            if err:
+                return self._json(403, {"error": "restart is " + err if err.startswith("only") else err})
             origin = self.headers.get("Origin")
             if origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host"):
                 return self._json(403, {"error": "cross-origin request refused"})
@@ -1053,9 +1504,11 @@ def make_handler(cfg, market, mood):
             self._json(202, {"ok": True, "pending": True, "start_cash": round(float(start_cash), 2),
                              "fee_pct": round(float(fee_pct), 4)})
 
-        def _send(self, code, body, ctype):
+        def _send(self, code, body, ctype, extra=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1102,9 +1555,12 @@ def main():
     ap.add_argument("--reset", action="store_true", help="wipe the ledger and start a new life")
     ap.add_argument("--think-budget", type=int, default=2000,
                     help="max reasoning tokens before the answer is forced into the JSON schema (0 = skip reasoning)")
+    ap.add_argument("--csv-delimiter", choices=["auto", "comma", "semicolon"], default="auto",
+                    help="CSV export style. auto follows your regional settings: a decimal comma means ';' columns and decimal commas (what Excel expects)")
     ap.add_argument("--mock", action="store_true", help="no LLM, random multi-coin orders (to test the dashboard)")
     cfg = ap.parse_args()
     cfg.fee_rate = cfg.fee_pct / 100
+    cfg.csv_sep = {"comma": ",", "semicolon": ";"}.get(cfg.csv_delimiter) or (";" if system_decimal_separator() == "," else ",")
     for stream in (sys.stdout, sys.stderr):         # a legacy Windows code page must never crash the loop on a print
         try:
             stream.reconfigure(errors="replace")

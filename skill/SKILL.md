@@ -114,7 +114,7 @@ One row per **life** in `bots`, so a restart archives the old life instead of de
 settings(key PRIMARY KEY, value)        -- start_cash, fee_pct, current_bot_id
 bots(id, name, model, cash, alive, started, died, ticks,
      start_cash, fee_rate, ended, final_value)   -- fee_rate is a fraction (0.001 = 0.10%)
-positions(bot_id, symbol, qty, avg_cost, PRIMARY KEY(bot_id, symbol))
+positions(bot_id, symbol, qty, avg_cost, last_price, PRIMARY KEY(bot_id, symbol))
 trades(id, bot_id, ts, turn, action, symbol, qty, price, usd, fee, cash_after, qty_after, reason)
 equity(id, bot_id, ts, btc_price, cash, positions_value, equity)      -- one row per turn
 decisions(id, bot_id, ts, turn, action, orders, watch, reason, note, error,
@@ -131,6 +131,7 @@ Migrations: when an older single-life ledger has no `start_cash` column on `bots
 ### Web server
 - `http.server.ThreadingHTTPServer`. Bind to **`127.0.0.1` by default**; the `--lan` flag binds `0.0.0.0` for phone access.
 - `GET /` serves `dashboard.html`. `GET /api/state` returns the active life, holdings, equity series, last 200 trades, last 30 decisions, news, mood, active config and saved settings. `GET /api/runs` lists every life.
+- `GET /api/report?run=<id>` returns a standalone, printable A4 HTML report for one life, and `GET /api/export.zip?run=<id>` a ZIP of CSVs plus `summary.json` (see "Exports" below). Both default to the current life, are read-only (open a separate SQLite connection with `PRAGMA query_only=ON`), work for alive, ended and dead lives, handle a life with no trades, and follow the same localhost-only rule as restart unless `--lan` is set.
 - `POST /api/restart` takes `{"start_cash": 100, "fee_pct": 0.2}` and replies `202` (the restart is applied when the current turn finishes). Validate server-side: both must be real numbers (not strings or booleans), `start_cash` 1 to 100000, `fee_pct` 0 to 5. Harden it:
   - accept it only from loopback addresses unless `--lan` is set (and check the `Host` header to resist DNS rebinding),
   - require `Content-Type: application/json` (so a web page on another site can't send it without a preflight, which the server never answers),
@@ -145,9 +146,15 @@ Migrations: when an older single-life ledger has no `start_cash` column on `bots
 - Holdings table plus an allocation doughnut (including cash). Trade table with a coin column.
 - Thoughts feed: reason, orders asked, watchlist, notes, rejections, and a collapsible "Show reasoning".
 - News & mood panel (Fear & Greed, trending, headlines with links and coin tags).
-- **Past lives** table: start cash, fee, turns, final value, status (running / ended / died).
+- **Past lives** table: start cash, fee, turns, final value, status (running / ended / died), and Report / CSV export links per life. The header has "Export report" and "Export data (CSV)" buttons for the current life.
 - **Settings panel:** starting amount, fee %, and a **Restart agent** button with an in-page confirmation modal (not `window.confirm`; keyboard accessible, Escape closes it). Don't overwrite inputs while the user is typing.
 - Escape every string that came from the model or a news feed before putting it in HTML, and only link `http(s)` URLs.
+
+### Exports
+- **Report** (`/api/report`): title, model and generated time; settings (start cash, fee, death line, interval, min volume); outcome (alive or dead with time, turns, duration, final value, P/L in $ and %, versus BTC buy and hold over the same period); stats (trades, buys, sells, fees, win rate on closed trades, best and worst trade, max drawdown, peak value, most-traded coins); an **inline SVG** chart generated in Python (total value vs start line vs BTC buy and hold, with different line styles so it reads in black and white; no JS or CDN, so it prints reliably); final holdings; the 5 biggest per-turn swings in total value with the agent's reason at that turn; the last 10 notes; the full trade table; and a "simulation, not financial advice" footer. Print CSS: `@page { size: A4 }`, repeating table headers, `break-inside: avoid` on rows and boxes, a page break before the trade table, and a "Print / Save as PDF" button hidden with `@media print`. Escape every model-written string.
+- **How the stats are derived:** replay the trade log per coin to get average cost (buy fees included). Score each SELL as proceeds minus sell fee minus cost, and count it a win if positive. Max drawdown is the worst peak-to-trough drop in the per-turn equity series. Store each position's last price (`positions.last_price`) every turn and when a life is archived, so a finished life's holdings can be valued later.
+- **ZIP** (`/api/export.zip`): build it in memory with `zipfile`. Contents: `trades.csv`, `equity.csv`, `decisions.csv` (include the stored reasoning text), `positions.csv`, `news.csv` (headlines published during that life) and `summary.json`. Name it `arena_life<id>_<YYYYMMDD-HHMM>.zip`.
+- **CSV rules for Excel:** write UTF-8 **with a BOM** and ISO timestamps. Excel decides the column separator from the system's decimal separator: with a decimal comma it expects `;` and decimal commas, and a comma-separated file opens as one column. So detect the decimal separator (on Windows `GetLocaleInfoEx(None, LOCALE_SDECIMAL=0x0E, ...)`; elsewhere guess from `LC_NUMERIC`/`LANG`) and offer an override flag. Prefix any text cell starting with `=`, `+`, `-` or `@` with `'`, because model- and feed-written text must never run as a spreadsheet formula.
 
 ## Step 3: Reasoning models (DeepSeek-R1) need special care
 
@@ -167,7 +174,8 @@ R1 distills love to overthink: 4,000 to 9,000+ tokens per turn, sometimes never 
 2. **Restart from the UI** (or `POST /api/restart`) with different settings, e.g. $100 and 0.2%. Check that the old life is archived and listed under Past lives, and the new life uses the new cash and fee (trade `fee / usd` should equal the new rate).
 3. **Validation and security:** out-of-range and non-numeric values give `400`; a wrong content type gives `415`; a foreign `Origin` or `Host` gives `403`.
 4. **Persistence:** stop and start `arena.py` (even with different `--cash`/`--fee` flags); the saved settings and the same life must come back.
-5. **Real model** for at least 5 turns: 0 parse failures, reasoning visible, no excluded coins bought.
+5. **Exports:** download the report and ZIP for the current life, a finished life and an empty (0-trade) life. Print the report to PDF (headless Edge or Chrome: `--headless=new --no-pdf-header-footer --print-to-pdf=out.pdf file.html`) and check the page size is A4, no table is cut off, and the chart is drawn. Open the CSVs in real Excel and check the columns, numbers and special characters (umlauts, emoji).
+6. **Real model** for at least 5 turns: 0 parse failures, reasoning visible, no excluded coins bought.
 
 ## Step 5: Make it shareable (before any public git push)
 
