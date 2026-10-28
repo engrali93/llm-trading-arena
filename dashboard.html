@@ -82,6 +82,21 @@
   .form input:focus-visible, .btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
   .btn { font:inherit; font-size:14px; font-weight:600; padding:9px 14px; border-radius:8px; cursor:pointer;
          border:1px solid var(--border); background:var(--panel); color:var(--text); }
+  .banner { margin:0 0 12px; padding:9px 14px; border-radius:10px; font-size:13px; font-weight:600;
+            background:color-mix(in srgb, var(--accent) 14%, transparent); color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+  .banner[hidden] { display:none; }
+  .banner.bad { background:color-mix(in srgb, var(--red) 14%, transparent); color:var(--red); border-color:color-mix(in srgb, var(--red) 35%, transparent); }
+  .toggles { display:grid; gap:10px; margin-top:12px; }
+  .tog { display:flex; gap:10px; align-items:flex-start; cursor:pointer; font-size:13px; }
+  .tog input { width:18px; height:18px; margin-top:2px; flex:none; accent-color:var(--accent); }
+  .tog span { display:grid; gap:2px; }
+  .tog small { color:var(--muted); font-size:11.5px; }
+  .lesson { padding:8px 0; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:flex-start; }
+  .lesson:last-child { border-bottom:0; }
+  .lesson .n { color:var(--muted); font-variant-numeric:tabular-nums; min-width:1.4em; }
+  .lesson .src { margin-left:auto; flex:none; font-size:11px; font-weight:600; padding:1px 7px; border-radius:999px; background:var(--chip); color:var(--muted); white-space:nowrap; }
+  .mem-on { background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent); }
+  .mem-off { background:var(--chip); color:var(--muted); }
   a.btn { display:inline-block; text-decoration:none; }
   .btn.sm { padding:5px 10px; font-size:12px; }
   .exports { display:flex; gap:8px; flex-wrap:wrap; }
@@ -110,14 +125,19 @@
   <header>
     <h1 id="title">LLM Trading Arena</h1>
     <span id="status" class="pill alive">…</span>
+    <span id="lifeline" class="cfgline" title="Life number, deaths so far, and whether this life has memory"></span>
     <span id="sub" class="sub"></span>
     <span id="cfgline" class="cfgline"></span>
     <span class="exports">
       <a id="x-report" class="btn sm" href="/api/report" target="_blank" rel="noopener">Export report</a>
       <a id="x-csv" class="btn sm" href="/api/export.zip" download>Export data (CSV)</a>
+      <a id="x-all" class="btn sm" href="/api/report/all" target="_blank" rel="noopener" title="One printable report covering every life">Export all lives</a>
+      <a id="x-all-csv" class="btn sm" href="/api/export_all.zip" download title="CSVs for every life in one ZIP, with a life_id column">All lives (CSV)</a>
     </span>
     <span id="conn" class="conn">Connecting…</span>
   </header>
+
+  <div id="banner" class="banner" role="status" hidden></div>
 
   <div class="cards">
     <div class="card"><div class="k">Total value</div><div class="v" id="c-eq">–</div><div class="s" id="c-eq-s"></div></div>
@@ -170,8 +190,8 @@
       <h2>Past lives <span id="lcount"></span></h2>
       <div class="tablewrap" style="max-height:260px">
         <table>
-          <thead><tr><th>#</th><th>Model</th><th>Started</th><th>Start cash</th><th>Fee</th><th>Turns</th><th>Final value</th><th>Status</th><th>Export</th></tr></thead>
-          <tbody id="lives"><tr><td colspan="9" class="empty">No lives yet</td></tr></tbody>
+          <thead><tr><th>#</th><th>Model</th><th>Started</th><th>Start cash</th><th>Fee</th><th>Memory</th><th>Turns</th><th>Final value</th><th>Status</th><th>Export</th></tr></thead>
+          <tbody id="lives"><tr><td colspan="10" class="empty">No lives yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -182,7 +202,22 @@
         <label>Fee (%) on every buy and sell, 0 to 5<input id="s-fee" type="number" min="0" max="5" step="0.01" inputmode="decimal"></label>
         <button id="s-restart" class="btn danger" type="button">Restart agent</button>
       </div>
+      <div class="toggles">
+        <label class="tog"><input id="t-auto" type="checkbox"><span>Auto-restart after death<small>reflects, waits 60 s, then starts a new life with the same settings</small></span></label>
+        <label class="tog"><input id="t-learn" type="checkbox"><span>Learning (memory from past lives)<small>applies from the next life, so a life never changes halfway</small></span></label>
+      </div>
       <div id="s-msg" class="smsg" role="status"></div>
+    </div>
+  </div>
+
+  <div class="grid3">
+    <div class="panel">
+      <h2>Lessons learned <span id="lnote"></span></h2>
+      <div class="feed" id="lessons" style="max-height:340px"><div class="empty">No lessons yet. The agent reflects when a life ends.</div></div>
+    </div>
+    <div class="panel">
+      <h2>Survival time per life <span id="snote"></span></h2>
+      <div class="donutbox" style="height:260px"><canvas id="survival"></canvas></div>
     </div>
   </div>
 
@@ -221,13 +256,27 @@ const base = s => String(s).replace(/USDT$/, '');
 const ago = ts => { const s = (Date.now() - new Date(ts)) / 1000; return s < 3600 ? Math.max(1, Math.floor(s/60)) + 'm ago' : s < 86400 ? Math.floor(s/3600) + 'h ago' : Math.floor(s/86400) + 'd ago'; };
 const safeUrl = u => /^https?:\/\//i.test(u) ? u : '#';
 
-let chart = null, donut = null;
+let chart = null, donut = null, survival = null;
 function initCharts() {
   if (typeof Chart === 'undefined') {
     $('.chartbox').innerHTML = '<div class="empty">Chart library didn\'t load (no internet?). Tables still update.</div>';
-    $('.donutbox').innerHTML = '';
+    document.querySelectorAll('.donutbox').forEach(b => { b.innerHTML = ''; });
     return;
   }
+  survival = new Chart($('#survival'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Survival time', data: [], backgroundColor: [], borderRadius: 4, maxBarThickness: 38 }] },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false },
+                 tooltip: { callbacks: {
+                   label: c => { const r = c.chart._runs && c.chart._runs[c.dataIndex]; return r ? ` ${fmtDur(r.duration_seconds)} · ${r.status}` : ''; },
+                   footer: items => { const r = items[0] && items[0].chart._runs && items[0].chart._runs[items[0].dataIndex]; return r ? `memory ${r.learning ? 'ON' : 'OFF'}` : ''; } } } },
+      scales: { x: { ticks: { color: cssv('--muted'), maxRotation: 0 }, grid: { display: false } },
+                y: { beginAtZero: true, title: { display: true, text: 'minutes', color: cssv('--muted') },
+                     ticks: { color: cssv('--muted') }, grid: { color: cssv('--border') } } },
+    },
+  });
   chart = new Chart($('#chart'), {
     type: 'line',
     data: { labels: [], datasets: [
@@ -245,7 +294,7 @@ function initCharts() {
       },
       scales: {
         x: { ticks: { color: cssv('--muted'), maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } },
-        y: { ticks: { color: cssv('--muted'), callback: v => '$' + v }, grid: { color: cssv('--border') } },
+        y: { ticks: { color: cssv('--muted'), callback: v => '$' + Math.round(v * 1000) / 1000 }, grid: { color: cssv('--border') } },
       },
     },
   });
@@ -367,6 +416,39 @@ function render(s) {
 
   renderChart(s);
   renderDonut(s);
+  renderMemory(s);
+}
+
+const fmtDur = sec => { sec = Math.max(0, Math.round(sec)); const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`; };
+
+function renderMemory(s) {
+  const m = s.memory, b = s.bot, d = m.deaths;
+  $('#lifeline').innerHTML = `Life #${Number(b.id)} · ${d === 0 ? 'never died' : `died ${d} ${d === 1 ? 'time' : 'times'}`} · memory ${b.learning ? 'ON' : 'OFF'}`;
+  let msg = '', bad = false;
+  if (m.phase === 'reflecting') msg = `Reflecting on life #${m.reflecting_life}: the agent is writing its lessons…`;
+  else if (m.phase === 'waiting') msg = `The agent died and has reflected. A new life starts in ${m.next_life_in ?? 0} s (auto-restart).`;
+  else if (m.phase === 'dead') { msg = `The agent is dead. ${m.auto_restart ? 'The maximum number of lives is reached.' : 'Auto-restart is off.'} Use "Restart agent" to begin a new life.`; bad = true; }
+  const bn = $('#banner'); bn.hidden = !msg; bn.textContent = msg; bn.className = 'banner' + (bad ? ' bad' : '');
+  $('#lnote').textContent = b.learning ? 'core wisdom (max 10), in this life\'s prompt' : 'memory is OFF for this life, so these are not used';
+  $('#lessons').innerHTML = m.core_lessons.length ? m.core_lessons.map((c, i) =>
+    `<div class="lesson"><span class="n">${i + 1}.</span><span>${esc(c.lesson)}</span><span class="src">Life ${Number(c.life)}</span></div>`).join('')
+    : '<div class="empty">No lessons yet. The agent reflects when a life ends (and memory is on).</div>';
+}
+
+function renderSurvival(runs) {
+  if (!survival) return;
+  const rs = [...runs].reverse();
+  const maxMin = Math.max(1, ...rs.map(r => r.duration_seconds / 60));
+  const hours = maxMin > 180, div = hours ? 3600 : 60;
+  survival._runs = rs;
+  survival.data.labels = rs.map(r => '#' + r.id + (r.learning ? ' ★' : ''));
+  const ds = survival.data.datasets[0];
+  ds.data = rs.map(r => Math.round(r.duration_seconds / div * 100) / 100);
+  ds.backgroundColor = rs.map(r => r.status === 'died' ? cssv('--red') : r.status === 'running' ? cssv('--accent') : cssv('--muted'));
+  survival.options.scales.y.title.text = hours ? 'hours' : 'minutes';
+  survival.update();
+  $('#snote').textContent = '★ memory on · red died · grey ended · blue running';
 }
 
 // ── settings + restart ──
@@ -383,6 +465,8 @@ function renderSettings(s) {
   }
   $('#x-report').href = `/api/report?run=${s.bot.id}`;
   $('#x-csv').href = `/api/export.zip?run=${s.bot.id}`;
+  if (document.activeElement !== $('#t-auto')) $('#t-auto').checked = s.memory.auto_restart;
+  if (document.activeElement !== $('#t-learn')) $('#t-learn').checked = s.memory.learning_next;
   const pending = !!s.restart_pending;
   $('#s-restart').disabled = pending || restarting;
   if (pending) setMsg('Restart queued: the new life starts as soon as the current turn finishes.');
@@ -425,6 +509,16 @@ async function confirmRestart() {
   } catch (e) { setMsg('Could not reach the agent.', true); $('#s-restart').disabled = false; }
 }
 
+async function saveToggle(key, el) {
+  try {
+    const res = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: el.checked }) });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { setMsg(body.error || `Could not save (${res.status}).`, true); el.checked = !el.checked; return; }
+    setMsg(key === 'learning' ? `Learning ${el.checked ? 'ON' : 'OFF'}: applies from the next life.` : `Auto-restart ${el.checked ? 'ON' : 'OFF'}.`);
+  } catch (e) { setMsg('Could not reach the agent.', true); el.checked = !el.checked; }
+}
+$('#t-auto').addEventListener('change', e => saveToggle('auto_restart', e.target));
+$('#t-learn').addEventListener('change', e => saveToggle('learning', e.target));
 $('#s-cash').addEventListener('input', () => { dirty = true; });
 $('#s-fee').addEventListener('input', () => { dirty = true; });
 $('#s-restart').addEventListener('click', openModal);
@@ -445,10 +539,12 @@ function renderLives(runs) {
   $('#lives').innerHTML = runs.length ? runs.map(r => {
     const pl = (r.final_value / r.start_cash - 1) * 100;
     return `<tr><td>${r.id}</td><td>${esc(r.model || '')}</td><td>${tfmt(r.started)}</td><td>${money(r.start_cash)}</td><td>${Number(r.fee_pct).toFixed(2)}%</td>
+      <td><span class="badge ${r.learning ? 'mem-on' : 'mem-off'}" title="${esc(r.summary || '')}">${r.learning ? 'ON' : 'OFF'}</span></td>
       <td>${r.turns}</td><td>${money(r.final_value)} <span class="${signCls(pl)}">(${pl >= 0 ? '+' : ''}${pl.toFixed(1)}%)</span></td>
       <td><span class="badge ${esc(r.status)}">${esc(r.status.toUpperCase())}</span></td>
       <td><a class="lnk" href="/api/report?run=${r.id}" target="_blank" rel="noopener" aria-label="Report for life ${r.id}">Report</a><a class="lnk" href="/api/export.zip?run=${r.id}" download aria-label="CSV data for life ${r.id}">CSV</a></td></tr>`;
-  }).join('') : '<tr><td colspan="9" class="empty">No lives yet</td></tr>';
+  }).join('') : '<tr><td colspan="10" class="empty">No lives yet</td></tr>';
+  renderSurvival(runs);
 }
 
 async function refresh() {

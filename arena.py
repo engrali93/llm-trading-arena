@@ -10,6 +10,7 @@ No exchange account, no API keys. Python standard library only.
 import argparse
 import collections
 import csv
+import difflib
 import email.utils
 import html
 import io
@@ -18,6 +19,7 @@ import math
 import os
 import random
 import re
+import signal
 import sqlite3
 import sys
 import threading
@@ -35,7 +37,25 @@ UA = {"User-Agent": "Mozilla/5.0 (llm-trading-arena)"}
 RESTART_LOCK = threading.Lock()
 RESTART_REQ = {"req": None}         # pending {"start_cash", "fee_pct"} from POST /api/restart
 WAKE = threading.Event()            # interrupts the between-turns nap when a restart is queued
+DB_WRITE_LOCK = threading.RLock()   # held while the loop writes the ledger, so a shutdown never cuts a write in half
+RUNTIME = {"db": None}              # ledger path, for the final WAL checkpoint on shutdown
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+# What the agent loop is doing right now, for the dashboard: trading / reflecting / waiting (for the next life) / dead.
+AGENT = {"phase": "trading", "next_life_at": None, "reflecting_life": None}
+LESSONS_SCHEMA = {
+    "type": "object",
+    "properties": {"lessons": {"type": "array", "minItems": 5, "maxItems": 10,
+                               "items": {"type": "string", "maxLength": 220}}},
+    "required": ["lessons"],
+}
+MERGE_SCHEMA = {
+    "type": "object",
+    "properties": {"lessons": {"type": "array", "minItems": 1, "maxItems": 10,
+                               "items": {"type": "string", "maxLength": 220}}},
+    "required": ["lessons"],
+}
+CORE_MAX = 10                       # size of the merged "core lessons" list
+WISDOM_MAX_TOKENS = 480             # budget for the wisdom block in the system prompt (rough 4 chars per token)
 
 BINANCE = "https://api.binance.com/api/v3"
 FEEDS = [("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
@@ -119,9 +139,12 @@ def load_excludes():
 # so every past life stays queryable through the bot_id on trades/equity/decisions/positions.
 BOTS_DDL = """CREATE TABLE bots(
     id INTEGER PRIMARY KEY, name TEXT, model TEXT, cash REAL, alive INTEGER, started TEXT, died TEXT,
-    ticks INTEGER DEFAULT 0, start_cash REAL, fee_rate REAL, ended TEXT, final_value REAL)"""
+    ticks INTEGER DEFAULT 0, start_cash REAL, fee_rate REAL, ended TEXT, final_value REAL,
+    learning INTEGER, summary TEXT, end_reason TEXT, reflected INTEGER DEFAULT 0, wisdom TEXT)"""
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY, life_id INTEGER, lesson TEXT, created TEXT);
+CREATE TABLE IF NOT EXISTS core_history(id INTEGER PRIMARY KEY, life_id INTEGER, created TEXT, core TEXT);
 CREATE TABLE IF NOT EXISTS positions(
     bot_id INTEGER, symbol TEXT, qty REAL, avg_cost REAL, PRIMARY KEY(bot_id, symbol));
 CREATE TABLE IF NOT EXISTS trades(
@@ -169,6 +192,13 @@ def init_db(path):
                               (SELECT equity FROM equity WHERE bot_id=bots_old.id ORDER BY id DESC LIMIT 1)
                        FROM bots_old""")
         con.execute("DROP TABLE bots_old")
+    have_bots = {r["name"] for r in con.execute("PRAGMA table_info(bots)")}
+    for col, typ in (("learning", "INTEGER"), ("summary", "TEXT"), ("end_reason", "TEXT"),
+                     ("reflected", "INTEGER DEFAULT 0"), ("wisdom", "TEXT")):      # per-life memory columns
+        if col not in have_bots:
+            con.execute(f"ALTER TABLE bots ADD COLUMN {col} {typ}")
+    # Lives that predate cross-life learning had no memory: mark them OFF so comparisons stay honest.
+    con.execute("UPDATE bots SET learning=0 WHERE learning IS NULL")
     con.commit()
     return con
 
@@ -205,13 +235,34 @@ def sync_settings(con, cfg):
     cfg.fee_rate = cfg.fee_pct / 100
 
 
+def get_toggle(con, name, default=True):
+    value = get_setting(con, name)
+    return default if value is None else value == "on"
+
+
+def set_toggle(con, name, on):
+    set_setting(con, name, "on" if on else "off")
+
+
+def sync_toggles(con, cfg):
+    """--learning / --auto-restart only change the saved toggle when passed explicitly; otherwise the saved value
+    (default ON), which the dashboard can flip, wins."""
+    for name, cli in (("learning", cfg.learning), ("auto_restart", cfg.auto_restart)):
+        if cli is not None:
+            set_toggle(con, name, cli == "on")
+    con.commit()
+
+
 def new_life(con, cfg, price):
-    """Start a fresh life with the current cfg.start_cash / cfg.fee_rate and make it the active one."""
+    """Start a fresh life with the current cfg.start_cash / cfg.fee_rate and make it the active one.
+    Whether it uses memory (learning) is decided now and stays fixed for the whole life."""
     model = "mock (random)" if cfg.mock else cfg.model
-    cur = con.execute("INSERT INTO bots(name, model, cash, alive, started, ticks, start_cash, fee_rate) "
-                      "VALUES(?,?,?,1,?,0,?,?)",
-                      (cfg.bot_name, model, cfg.start_cash, now_iso(), cfg.start_cash, cfg.fee_rate))
+    learning = 1 if get_toggle(con, "learning") else 0
+    cur = con.execute("INSERT INTO bots(name, model, cash, alive, started, ticks, start_cash, fee_rate, learning, reflected) "
+                      "VALUES(?,?,?,1,?,0,?,?,?,0)",
+                      (cfg.bot_name, model, cfg.start_cash, now_iso(), cfg.start_cash, cfg.fee_rate, learning))
     bid = cur.lastrowid
+    con.execute("UPDATE bots SET wisdom=? WHERE id=?", (wisdom_section(con, {"id": bid, "learning": learning}), bid))
     set_setting(con, "current_bot_id", bid)
     con.execute("INSERT INTO equity(bot_id, ts, btc_price, cash, positions_value, equity) VALUES(?,?,?,?,?,?)",
                 (bid, now_iso(), price, cfg.start_cash, 0.0, cfg.start_cash))
@@ -226,16 +277,22 @@ def apply_pending_restart(con, cfg, market, bot):
     if not req:
         return None
     pos = load_positions(con, bot["id"])
-    final = total_value(bot["cash"], pos, market.prices)
-    con.execute("UPDATE bots SET ended=?, final_value=? WHERE id=?", (now_iso(), final, bot["id"]))
-    for sym in pos:                                     # remember the prices the final holdings were valued at
-        con.execute("UPDATE positions SET last_price=? WHERE bot_id=? AND symbol=?",
-                    (market.prices.get(sym), bot["id"], sym))
+    final = bot["final_value"] if (not bot["alive"] and bot["final_value"] is not None) else total_value(bot["cash"], pos, market.prices)
+    reason = "died" if not bot["alive"] else ("model change" if req.get("model_change") else "restarted")
+    with DB_WRITE_LOCK:
+        con.execute("UPDATE bots SET ended=?, final_value=?, end_reason=COALESCE(end_reason, ?) WHERE id=?",
+                    (now_iso(), final, reason, bot["id"]))
+        for sym in pos:                                 # remember the prices the final holdings were valued at
+            con.execute("UPDATE positions SET last_price=? WHERE bot_id=? AND symbol=?",
+                        (market.prices.get(sym), bot["id"], sym))
+        con.commit()
+    finish_life(con, cfg, market, bot["id"])            # summary + reflection (if memory was on) before the next life
     cfg.start_cash, cfg.fee_pct = req["start_cash"], req["fee_pct"]
     cfg.fee_rate = cfg.fee_pct / 100
-    set_setting(con, "start_cash", cfg.start_cash)
-    set_setting(con, "fee_pct", cfg.fee_pct)
-    new = new_life(con, cfg, market.btc)
+    with DB_WRITE_LOCK:
+        set_setting(con, "start_cash", cfg.start_cash)
+        set_setting(con, "fee_pct", cfg.fee_pct)
+        new = new_life(con, cfg, market.btc)
     print(f"\n>> Restart: life #{bot['id']} archived at ${final:.2f} after {bot['ticks']} turns. "
           f"New life #{new['id']}: start ${cfg.start_cash:.2f}, fee {cfg.fee_pct:g}%\n", flush=True)
     return new
@@ -245,6 +302,25 @@ def nap(seconds):
     """Sleep between turns; a queued restart (or shutdown) wakes it immediately."""
     WAKE.wait(max(0.0, seconds))
     WAKE.clear()
+
+
+def graceful_exit(why):
+    """Stop the whole process cleanly and quickly. It waits for a ledger write that is in progress (the loop holds
+    DB_WRITE_LOCK while writing) but not for a slow model call, which has nothing half-written. Then it folds the WAL
+    file into the database and exits. Runs in its own thread so the main thread can finish its write first."""
+    STOP.set()
+    WAKE.set()
+    print(f"\n{why}: finishing any ledger write in progress, then stopping...", flush=True)
+    with DB_WRITE_LOCK:
+        try:
+            if RUNTIME["db"]:
+                c = sqlite3.connect(RUNTIME["db"], timeout=10)
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                c.close()
+        except Exception as e:
+            print(f"(checkpoint skipped: {e})", flush=True)
+        print("Stopped. The ledger is saved; start again to continue this life.", flush=True)
+        os._exit(0)
 
 
 def load_positions(con, bot_id):
@@ -497,12 +573,13 @@ class Mood:
 
 
 # ───────────────────────── the agent ─────────────────────────
-def system_prompt(cfg):
+def system_prompt(cfg, wisdom=""):
     if cfg.living_cost > 0:
         living = (f"Being alive costs ${cfg.living_cost:.2f} every turn, taken from your cash "
                   f"(or from your holdings if you have no cash).")
     else:
         living = "Staying alive is free; only fees and bad trades can hurt you."
+    wisdom_block = f"\n{wisdom}\n" if wisdom else ""
     return f"""You are {cfg.bot_name}, an autonomous trader living inside a simulation.
 Nobody will give you instructions after this message. Every decision is yours.
 
@@ -517,7 +594,7 @@ THE RULES OF YOUR WORLD
 - You can buy only coins in the current list, at least $1 each. A buy larger than your cash is shrunk to what you can afford. You can sell any coin you own.
 - Orders the referee rejects are reported back to you next turn.
 - "watch" lists up to 5 coins whose last 24 hourly prices you want to see next turn.
-
+{wisdom_block}
 Reply with ONLY a JSON object, nothing else:
 {{"orders": [{{"action": "buy", "symbol": "<SYMBOL>USDT", "usd": <dollars>}}, {{"action": "sell", "symbol": "<SYMBOL>USDT", "sell_pct": <1-100>}}], "watch": ["<SYMBOL>USDT"], "reason": "<one short sentence>", "note": "<optional memo to your future self, or empty string>"}}"""
 
@@ -610,7 +687,7 @@ def trim_thinking(th, limit=1500):
     return th if len(th) <= limit else th[:600] + "\n[...]\n" + th[-(limit - 610):]
 
 
-def ask_ollama(cfg, system, user):
+def ask_ollama(cfg, system, user, schema=REPLY_SCHEMA, final_predict=600):
     """Returns (reply_text, thinking, prompt_tokens, eval_tokens, used_stage2).
     Stage 1: /api/chat with a JSON-schema `format` and think=true; R1's reasoning arrives in message.thinking.
     R1 distills often ramble past any sane token budget before answering, so if stage 1 ends without content,
@@ -620,7 +697,7 @@ def ask_ollama(cfg, system, user):
     thinking, content = "", ""
     if cfg.think_budget > 0:
         d = _post(cfg.host, "/api/chat", {
-            "model": cfg.model, "stream": False, "think": True, "format": REPLY_SCHEMA,
+            "model": cfg.model, "stream": False, "think": True, "format": schema,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "options": {"temperature": 0.7, "num_predict": cfg.think_budget, "num_ctx": cfg.num_ctx}})
         msg = d["message"]
@@ -632,8 +709,8 @@ def ask_ollama(cfg, system, user):
     prompt = (f"<｜begin▁of▁sentence｜>{system}<｜User｜>{user}"
               f"<｜Assistant｜><think>\n{thinking.strip()}{closing}</think>\n\n")
     d = _post(cfg.host, "/api/generate", {
-        "model": cfg.model, "stream": False, "raw": True, "prompt": prompt, "format": REPLY_SCHEMA,
-        "options": {"temperature": 0.5, "num_predict": 600, "num_ctx": cfg.num_ctx}})
+        "model": cfg.model, "stream": False, "raw": True, "prompt": prompt, "format": schema,
+        "options": {"temperature": 0.5, "num_predict": final_predict, "num_ctx": cfg.num_ctx}})
     return (d["response"], trim_thinking(thinking), ptok + (d.get("prompt_eval_count") or 0),
             etok + (d.get("eval_count") or 0), True)
 
@@ -813,6 +890,270 @@ def charge_living_cost(cash, positions, prices, cost):
     return 0.0, {s: p for s, p in positions.items() if p["qty"] > 1e-12}
 
 
+# ───────────────────────── memory: reflection, lessons, wisdom ─────────────────────────
+def short_duration(seconds):
+    s = int(max(0, seconds))
+    if s >= 86400:
+        return f"{s // 86400}d {(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h"
+    return f"{max(1, s // 60)}m"
+
+
+def similar(a, b):
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def load_core(con):
+    """The current wisdom: up to CORE_MAX lessons, each {"lesson": text, "life": the life that taught it}."""
+    try:
+        data = json.loads(get_setting(con, "core_lessons") or "[]")
+    except ValueError:
+        return []
+    return [d for d in data if isinstance(d, dict) and isinstance(d.get("lesson"), str)]
+
+
+def save_core(con, core):
+    set_setting(con, "core_lessons", json.dumps(core))
+
+
+def clean_lessons(items):
+    out = []
+    for x in items:
+        if not isinstance(x, str):
+            continue
+        t = " ".join(x.split())[:220].strip()
+        if len(t) >= 12 and not any(similar(t, o) > 0.9 for o in out):
+            out.append(t)
+    return out[:10]
+
+
+def parse_lessons(text):
+    """Strip any <think> block and take the last JSON object that has a "lessons" list."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    for cand in reversed(list(json_objects(text))):
+        try:
+            d = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d, dict) and isinstance(d.get("lessons"), list):
+            out = clean_lessons(d["lessons"])
+            if out:
+                return out
+    raise ValueError("no lessons found in model reply")
+
+
+def one_line_summary(S):
+    """e.g. "Life 2: survived 14h, died at $0.98 after going all-in on PEPE" (built from the ledger, not by the model)."""
+    s = S["summary"]
+    if s["status"] == "DEAD":
+        outcome = f"died at ${s['final_value']:.2f}"
+    else:
+        outcome = f"ended by a restart at ${s['final_value']:.2f} ({s['pl_pct']:+.1f}%)"
+    clause = ""
+    worst = s["closed_trades"]["worst"]
+    if s["all_in"]:
+        clause = f" after going all-in on {base_of(s['all_in']['symbol'])}"
+    elif worst and worst["pnl_usd"] < 0:
+        clause = f"; worst trade {base_of(worst['symbol'])} {worst['pnl_usd']:+.2f}"
+    return f"Life {s['life_id']}: survived {short_duration(s['duration_seconds'])}, {outcome}{clause}"[:170]
+
+
+REFLECTION_SYSTEM = (
+    "You are {name}, an autonomous trader in a simulation. One of your lives just ended. Study the summary and write "
+    "5 to 10 short, concrete lessons for your future self: one sentence each, under 200 characters. Be specific: "
+    "name the rules of your world (fees, minimum volume, order limits, shrinking) and the exact habits or mistakes "
+    "that cost or earned money, using the trades and coins in the summary. No generic advice, no repetition. "
+    'Reply with ONLY a JSON object: {{"lessons": ["...", "..."]}}')
+
+
+def reflection_prompt(S, cfg):
+    """A compact life summary (aim for under ~1000 tokens) plus the system prompt for the reflection call."""
+    s, st = S["summary"], S["summary"]["settings"]
+    dd, tr, ct = s["drawdown"], s["trades"], s["closed_trades"]
+    if s["status"] == "DEAD":
+        outcome = (f"YOU DIED: total value fell to ${s['final_value']:.2f}, below the ${st['death_line']:g} death line")
+    else:
+        outcome = f"This life was ended by a restart at ${s['final_value']:.2f} (you did not die)"
+    btc = s["btc_buy_and_hold"]
+    lines = [
+        f"RULES: you started with ${st['start_cash']:.2f}; every buy and sell costs a {st['fee_pct']:.2f}% fee; you die below "
+        f"${st['death_line']:g}; max 3 orders per turn; coins under ${st['min_volume_usd'] / 1e6:g}M 24h volume can't be bought.",
+        f"LIFE #{s['life_id']}: {outcome}.",
+        f"Survived {s['turns']} turns ({fmt_duration(s['duration_seconds'])}). Start ${st['start_cash']:.2f}, "
+        f"peak ${dd['peak_value']:.2f}, final ${s['final_value']:.2f} ({s['pl_pct']:+.1f}%). "
+        f"Max drawdown {dd['max_drawdown_pct']:.1f}%."
+        + (f" BTC buy and hold over the same time: {btc['pl_pct']:+.2f}%." if btc else ""),
+        f"{tr['count']} trades ({tr['buys']} buys, {tr['sells']} sells), fees paid ${tr['fees_paid']:.2f}. "
+        + (f"Win rate on closed trades {ct['win_rate_pct']:.0f}% ({ct['wins']} of {ct['count']})." if ct["count"] else "No closed trades."),
+    ]
+    if s["all_in"]:
+        a = s["all_in"]
+        lines.append(f"Biggest single buy: ${a['usd']:.2f} of {base_of(a['symbol'])} on turn {a['turn']}, almost all your cash.")
+
+    def trade_line(c):
+        return (f"- turn {c['turn']}, sold {base_of(c['symbol'])}: {c['pnl_usd']:+.2f} ({c['pnl_pct']:+.1f}%); "
+                f"your reason then: \"{(c.get('reason') or '')[:110]}\"")
+
+    closed = sorted(S["closed"], key=lambda c: c["pnl_usd"])
+    best = [c for c in reversed(closed) if c["pnl_usd"] > 0][:5]
+    worst = [c for c in closed if c["pnl_usd"] <= 0 and c not in best][:5]
+    if best:
+        lines += ["5 BEST CLOSED TRADES:"] + [trade_line(c) for c in best]
+    if worst:
+        lines += ["5 WORST CLOSED TRADES:"] + [trade_line(c) for c in worst]
+    coins = S["summary"]["coin_results"]
+    if coins:
+        lines.append("HOW THE COINS YOU BOUGHT PERFORMED (realized + unrealized, $): " + ", ".join(
+            f"{base_of(c['symbol'])} {c['net']:+.2f}" for c in (coins[:6] + [x for x in coins[-6:] if x not in coins[:6]])))
+    last = S["decisions"][-4:]
+    if last:
+        lines += ["YOUR LAST DECISIONS:"] + [f"- turn {d['turn']}: {d['orders']} | {(d['reason'] or '')[:100]}" for d in last]
+    notes = s["last_notes"][:5]
+    if notes:
+        lines += ["YOUR LAST NOTES TO SELF:"] + [f"- turn {n['turn']}: {n['note'][:140]}" for n in notes]
+    return REFLECTION_SYSTEM.format(name=cfg.bot_name), "\n".join(lines)[:5200]
+
+
+def mock_lessons(S):
+    """Offline stand-in for the model: lessons built from the numbers, so the whole pipeline can be tested."""
+    s = S["summary"]
+    tr, dd = s["trades"], s["drawdown"]
+    coins = s["coin_results"]
+    out = [
+        f"Fees took ${tr['fees_paid']:.2f} over {tr['count']} trades in life {s['life_id']}; trade less, every order costs {s['settings']['fee_pct']:.2f}%.",
+        f"Max drawdown reached {dd['max_drawdown_pct']:.0f}% in life {s['life_id']}; keep positions smaller so one bad coin cannot sink the run.",
+        "Never spend the last dollars: keep cash above $1 plus fees so a bad move cannot end the life.",
+        f"Life {s['life_id']} {'died' if s['status'] == 'DEAD' else 'ended'} after {s['turns']} turns; spread money over several high-volume coins.",
+    ]
+    if coins:
+        out.append(f"{base_of(coins[0]['symbol'])} was the worst coin in life {s['life_id']} ({coins[0]['net']:+.2f}); do not chase it again.")
+    else:
+        out.append(f"Life {s['life_id']} made no coin trades; waiting forever earns nothing, so take small, high-volume positions.")
+    return out
+
+
+def llm_lessons(cfg, system, user):
+    last = None
+    for _ in range(2):                                              # one retry, like the trading calls
+        raw, _think, _p, _e, _s2 = ask_ollama(cfg, system, user, LESSONS_SCHEMA, 900)
+        try:
+            return parse_lessons(raw)
+        except ValueError as e:
+            last = e
+    raise last
+
+
+def dedupe_lessons(items, threshold=0.82):
+    """Keep the first of any near-duplicate pair (older lessons win, so their source life is preserved)."""
+    out = []
+    for it in items:
+        if not any(similar(it["lesson"], o["lesson"]) >= threshold for o in out):
+            out.append(it)
+    return out
+
+
+def attribute_life(text, pool, default_life):
+    best, life = 0.0, default_life
+    for it in pool:
+        r = similar(text, it["lesson"])
+        if r > best:
+            best, life = r, it["life"]
+    return life if best >= 0.55 else default_life
+
+
+def merge_core_lessons(con, cfg, new_lessons, life_id):
+    """Old core lessons + this life's lessons -> a max-10 list without duplicates. If it still has more than 10 the
+    model picks the most useful ones; its answer is mapped back to the life that taught each lesson."""
+    combined = load_core(con) + [{"lesson": t, "life": life_id} for t in new_lessons]
+    merged = dedupe_lessons(combined)
+    if len(merged) > CORE_MAX:
+        if cfg.mock:
+            merged = merged[-CORE_MAX:]
+        else:
+            try:
+                numbered = "\n".join(f"{i}. {m['lesson']}" for i, m in enumerate(merged, 1))
+                system = ("You curate a trader's core wisdom: at most 10 short, concrete lessons. Merge the list you are given: "
+                          "remove duplicates and near-duplicates, drop vague advice, keep the most useful and best-supported "
+                          "lessons, and shorten wording if needed (each under 200 characters). "
+                          'Reply with ONLY a JSON object: {"lessons": ["...", "..."]}')
+                raw, _t, _p, _e, _s2 = ask_ollama(cfg, system, f"ALL LESSONS SO FAR (oldest first):\n{numbered}", MERGE_SCHEMA, 900)
+                texts = parse_lessons(raw)
+                merged = [{"lesson": t, "life": attribute_life(t, merged, life_id)} for t in texts][:CORE_MAX]
+            except Exception as e:
+                print(f"[reflection] merge by the model failed ({type(e).__name__}: {e}); keeping the newest {CORE_MAX}", flush=True)
+                merged = merged[-CORE_MAX:]
+    with DB_WRITE_LOCK:
+        save_core(con, merged)
+        con.execute("INSERT INTO core_history(life_id, created, core) VALUES(?,?,?)", (life_id, now_iso(), json.dumps(merged)))
+        con.commit()
+    return merged
+
+
+def wisdom_section(con, bot):
+    """The block added to the system prompt of a life that has memory ON: core lessons plus one line per past life.
+    Only lives that also had memory ON count as 'your past lives'. Trimmed to stay under ~500 tokens."""
+    if not bot.get("learning"):
+        return ""
+    core = load_core(con)
+    past = [dict(r) for r in con.execute(
+        "SELECT id, summary FROM bots WHERE id<? AND learning=1 AND summary IS NOT NULL AND summary<>'' "
+        "ORDER BY id DESC LIMIT 5", (bot["id"],))][::-1]
+    if not core and not past:
+        return ""
+    deaths = con.execute("SELECT COUNT(*) FROM bots WHERE id<? AND learning=1 AND alive=0", (bot["id"],)).fetchone()[0]
+
+    def render(core_items, past_items):
+        lines = [f"WISDOM FROM YOUR PAST LIVES (you have died {deaths} time{'s' if deaths != 1 else ''} before)"]
+        if core_items:
+            lines += ["Lessons you wrote for yourself:"] + [f"{i}. {c['lesson']}" for i, c in enumerate(core_items, 1)]
+        if past_items:
+            lines += ["Your past lives:"] + [f"- {p['summary']}" for p in past_items]
+        lines.append("Use this wisdom, but keep thinking for yourself.")
+        return "\n".join(lines)
+
+    text = render(core, past)
+    while len(text) / 4 > WISDOM_MAX_TOKENS and (len(past) > 1 or len(core) > 3):
+        if len(past) > 1:
+            past = past[1:]                                         # oldest past-life line goes first
+        else:
+            core = core[:-1]
+        text = render(core, past)
+    return text
+
+
+def finish_life(con, cfg, market, bot_id):
+    """Close a life's books: store its one-line summary and, if it had memory ON, reflect on it, save the lessons and
+    fold them into the core wisdom. Runs for deaths and for manual restarts, before the next life is created."""
+    row = con.execute("SELECT * FROM bots WHERE id=?", (bot_id,)).fetchone()
+    if not row or row["reflected"]:
+        return
+    S = life_stats(con, cfg, market, bot_id)
+    with DB_WRITE_LOCK:
+        con.execute("UPDATE bots SET summary=? WHERE id=?", (one_line_summary(S), bot_id))
+        con.commit()
+    if row["learning"] and row["ticks"] > 0:
+        AGENT.update(phase="reflecting", reflecting_life=bot_id)
+        t0 = time.time()
+        try:
+            system, user = reflection_prompt(S, cfg)
+            lessons = mock_lessons(S) if cfg.mock else llm_lessons(cfg, system, user)
+            now = now_iso()
+            with DB_WRITE_LOCK:
+                con.executemany("INSERT INTO lessons(life_id, lesson, created) VALUES(?,?,?)", [(bot_id, t, now) for t in lessons])
+                con.commit()
+            core = merge_core_lessons(con, cfg, lessons, bot_id)
+            print(f"[reflection] life #{bot_id}: {len(lessons)} lessons saved, core wisdom now {len(core)} lessons "
+                  f"({time.time() - t0:.0f}s)", flush=True)
+        except Exception as e:
+            print(f"[reflection] life #{bot_id} failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            AGENT.update(phase="trading", reflecting_life=None)
+    with DB_WRITE_LOCK:
+        con.execute("UPDATE bots SET reflected=1 WHERE id=?", (bot_id,))
+        con.commit()
+
+
 # ───────────────────────── simulation loop ─────────────────────────
 def run_sim(cfg, market, mood):
     con = init_db(cfg.db)
@@ -833,8 +1174,9 @@ def run_sim(cfg, market, mood):
             print(f"Model changed ({bot['model']} -> {model_now}): archiving life #{bot['id']} and starting a new one "
                   f"with the same settings.", flush=True)
             with RESTART_LOCK:
-                RESTART_REQ["req"] = {"start_cash": cfg.start_cash, "fee_pct": round(cfg.fee_rate * 100, 4)}
+                RESTART_REQ["req"] = {"start_cash": cfg.start_cash, "fee_pct": round(cfg.fee_rate * 100, 4), "model_change": True}
     announced_death = False
+    announced_life = None
     news_ts = 0.0
 
     while not STOP.is_set():
@@ -842,15 +1184,47 @@ def run_sim(cfg, market, mood):
         restarted = apply_pending_restart(con, cfg, market, bot)
         if restarted:
             bot, announced_death = restarted, False
+            AGENT.update(phase="trading", next_life_at=None)
         bot = dict(con.execute("SELECT * FROM bots WHERE id=?", (bot["id"],)).fetchone())
-        system = system_prompt(cfg)
+        system = system_prompt(cfg, bot.get("wisdom") or "")
+        if announced_life != bot["id"]:
+            announced_life = bot["id"]
+            w = bot.get("wisdom") or ""
+            print(f"[life #{bot['id']}] memory {'ON' if bot['learning'] else 'OFF'}; wisdom in the system prompt: "
+                  f"{w.count(chr(10)) + 1 if w else 0} lines, about {len(w) // 4} tokens", flush=True)
         if not bot["alive"]:
+            if not bot["reflected"]:                         # just died: close the books and learn from it
+                print(f"\nXX {bot['name']} died after {bot['ticks']} turns at ${bot['final_value']:.2f}.", flush=True)
+                with DB_WRITE_LOCK:
+                    con.execute("UPDATE bots SET end_reason=COALESCE(end_reason, 'died') WHERE id=?", (bot["id"],))
+                    con.commit()
+                finish_life(con, cfg, market, bot["id"])
+                bot = dict(con.execute("SELECT * FROM bots WHERE id=?", (bot["id"],)).fetchone())
+            lives = con.execute("SELECT COUNT(*) FROM bots").fetchone()[0]
+            if get_toggle(con, "auto_restart") and lives < cfg.max_lives:
+                if AGENT["next_life_at"] is None:
+                    AGENT.update(phase="waiting", next_life_at=time.time() + cfg.restart_delay)
+                    print(f"Auto-restart: a new life starts in {cfg.restart_delay:g}s (life {lives + 1} of at most {cfg.max_lives}).", flush=True)
+                remaining = AGENT["next_life_at"] - time.time()
+                if remaining > 0:
+                    nap(min(5.0, remaining))
+                    continue
+                with DB_WRITE_LOCK:
+                    con.execute("UPDATE bots SET ended=? WHERE id=?", (now_iso(), bot["id"]))
+                    con.commit()
+                    bot = new_life(con, cfg, market.btc)     # same settings, same model; memory per the current toggle
+                AGENT.update(phase="trading", next_life_at=None)
+                announced_death = False
+                print(f">> Auto-restart: new life #{bot['id']} (start ${cfg.start_cash:.2f}, fee {cfg.fee_pct:g}%).", flush=True)
+                continue
+            AGENT.update(phase="dead", next_life_at=None)
             if not announced_death:
-                print(f"\nXX {bot['name']} died after {bot['ticks']} turns. Dashboard stays up; restart it from the "
-                      f"dashboard settings panel, or rerun with --reset.")
+                why = "the maximum number of lives is reached" if (lives >= cfg.max_lives and get_toggle(con, "auto_restart")) else "auto-restart is off"
+                print(f"The dashboard stays up; {why}. Restart from the dashboard settings panel, or rerun with --reset.", flush=True)
                 announced_death = True
             nap(5)
             continue
+        AGENT.update(phase="trading", next_life_at=None)
 
         market.tick()
         if time.time() - news_ts > 900:
@@ -909,32 +1283,33 @@ def run_sim(cfg, market, mood):
         new_watch = [s for s in new_watch if s in prices]
         ts = now_iso()
 
-        for t in trades:
-            con.execute(
-                "INSERT INTO trades(bot_id, ts, turn, action, symbol, qty, price, usd, fee, cash_after, qty_after, reason)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (bot["id"], ts, turn, t["action"], t["symbol"], t["qty"], t["price"], t["usd"], t["fee"],
-                 t["cash_after"], t["qty_after"], reason))
+        with DB_WRITE_LOCK:                                  # a shutdown waits for these writes, never cuts them
+            for t in trades:
+                con.execute(
+                    "INSERT INTO trades(bot_id, ts, turn, action, symbol, qty, price, usd, fee, cash_after, qty_after, reason)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (bot["id"], ts, turn, t["action"], t["symbol"], t["qty"], t["price"], t["usd"], t["fee"],
+                     t["cash_after"], t["qty_after"], reason))
 
-        cash, positions = charge_living_cost(cash, positions, prices, cfg.living_cost)
-        pos_val = sum(p["qty"] * prices.get(s, p["avg"]) for s, p in positions.items())
-        eq = cash + pos_val
-        alive = 1 if eq >= cfg.death_line else 0
+            cash, positions = charge_living_cost(cash, positions, prices, cfg.living_cost)
+            pos_val = sum(p["qty"] * prices.get(s, p["avg"]) for s, p in positions.items())
+            eq = cash + pos_val
+            alive = 1 if eq >= cfg.death_line else 0
 
-        summary = ", ".join(
-            f"{str(o.get('action')).upper()} {base_of(norm_symbol(o.get('symbol'), prices))}"
-            + (f" ${o['usd']}" if o.get("usd") else "") + (f" {o['sell_pct']}%" if o.get("sell_pct") else "")
-            for o in orders[:3] if isinstance(o, dict)) or "none"
-        con.execute("INSERT INTO decisions(bot_id, ts, turn, action, orders, watch, reason, note, error,"
-                    " prompt_tokens, eval_tokens, thinking, duration, stage2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (bot["id"], ts, turn, "trade" if trades else "hold", summary, json.dumps(new_watch),
-                     reason, note, error, ptok, etok, thinking, time.time() - t0, stage2))
-        con.execute("INSERT INTO equity(bot_id, ts, btc_price, cash, positions_value, equity) VALUES(?,?,?,?,?,?)",
-                    (bot["id"], ts, market.btc, cash, pos_val, eq))
-        save_positions(con, bot["id"], positions, prices)
-        con.execute("UPDATE bots SET cash=?, alive=?, ticks=?, died=?, final_value=? WHERE id=?",
-                    (cash, alive, turn, None if alive else ts, eq, bot["id"]))
-        con.commit()
+            summary = ", ".join(
+                f"{str(o.get('action')).upper()} {base_of(norm_symbol(o.get('symbol'), prices))}"
+                + (f" ${o['usd']}" if o.get("usd") else "") + (f" {o['sell_pct']}%" if o.get("sell_pct") else "")
+                for o in orders[:3] if isinstance(o, dict)) or "none"
+            con.execute("INSERT INTO decisions(bot_id, ts, turn, action, orders, watch, reason, note, error,"
+                        " prompt_tokens, eval_tokens, thinking, duration, stage2) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (bot["id"], ts, turn, "trade" if trades else "hold", summary, json.dumps(new_watch),
+                         reason, note, error, ptok, etok, thinking, time.time() - t0, stage2))
+            con.execute("INSERT INTO equity(bot_id, ts, btc_price, cash, positions_value, equity) VALUES(?,?,?,?,?,?)",
+                        (bot["id"], ts, market.btc, cash, pos_val, eq))
+            save_positions(con, bot["id"], positions, prices)
+            con.execute("UPDATE bots SET cash=?, alive=?, ticks=?, died=?, final_value=? WHERE id=?",
+                        (cash, alive, turn, None if alive else ts, eq, bot["id"]))
+            con.commit()
 
         tr = " ".join(f"{t['action']} {base_of(t['symbol'])} ${t['usd']:.2f}" for t in trades) or "HOLD"
         tok = (f" | tok {ptok}+{etok}" if ptok else "") + (" | stage2" if stage2 else "")
@@ -983,7 +1358,8 @@ def replay_closed_trades(trades):
             cost = t["qty"] * p[1]
             pnl = t["usd"] - t["fee"] - cost
             closed.append({"symbol": t["symbol"], "turn": t["turn"], "ts": t["ts"], "price": t["price"],
-                           "avg_cost": p[1], "pnl_usd": pnl, "pnl_pct": pnl / cost * 100 if cost else 0.0})
+                           "avg_cost": p[1], "pnl_usd": pnl, "pnl_pct": pnl / cost * 100 if cost else 0.0,
+                           "reason": t.get("reason") or ""})
             p[0] = max(0.0, p[0] - t["qty"])
     return closed
 
@@ -1046,6 +1422,20 @@ def life_stats(con, cfg, market, bot_id):
         by_coin[t["symbol"]][1] += t["usd"]
     top_coins = [{"symbol": s, "trades": n, "volume_usd": v}
                  for s, (n, v) in sorted(by_coin.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))[:5]]
+    realized = collections.defaultdict(float)
+    for c in closed:
+        realized[c["symbol"]] += c["pnl_usd"]
+    unrealized = {h["symbol"]: h["value"] - h["qty"] * h["avg_cost"] for h in holdings}
+    coin_results = sorted(
+        ({"symbol": sym, "realized": realized.get(sym, 0.0), "unrealized": unrealized.get(sym, 0.0),
+          "net": realized.get(sym, 0.0) + unrealized.get(sym, 0.0)} for sym in set(by_coin) | set(unrealized)),
+        key=lambda r: r["net"])
+    all_in = None                                   # a single buy that used (almost) all the cash the agent had
+    for t in trades:
+        if t["action"] == "BUY":
+            before = t["cash_after"] + t["usd"] + t["fee"]
+            if t["usd"] >= 0.8 * before and t["usd"] >= 0.3 * start_cash and (all_in is None or t["usd"] > all_in["usd"]):
+                all_in = {"symbol": t["symbol"], "usd": t["usd"], "turn": t["turn"]}
 
     by_ts = {d["ts"]: d for d in decisions}
     moments = []
@@ -1075,8 +1465,13 @@ def life_stats(con, cfg, market, bot_id):
                           "worst": min(closed, key=lambda c: c["pnl_usd"]) if closed else None},
         "drawdown": {"peak_value": peak_value, "max_drawdown_pct": max_dd * 100, "max_drawdown_usd": max_dd_usd},
         "top_coins": top_coins, "holdings": holdings, "key_moments": moments, "last_notes": notes,
+        "coin_results": coin_results, "all_in": all_in,
+        "learning": bool(bot.get("learning")), "end_reason": bot.get("end_reason"), "life_summary": bot.get("summary"),
+        "wisdom_at_start": bot.get("wisdom") or "",
+        "lessons": [dict(r) for r in con.execute("SELECT lesson, created FROM lessons WHERE life_id=? ORDER BY id", (bot_id,))],
     }
     return {"summary": summary, "bot": bot, "equity": equity, "trades": trades, "decisions": decisions, "live": live,
+            "closed": closed,
             "end_iso": end_iso or now_iso()}
 
 
@@ -1151,6 +1546,9 @@ svg { width: 100%; height: auto; display: block; page-break-inside: avoid; break
 .btn { font: inherit; font-weight: 600; padding: 2mm 4mm; border: 1px solid #444; background: #fff; border-radius: 2mm; cursor: pointer; }
 .break { page-break-before: always; break-before: page; }
 .note { margin: 1mm 0; }
+.wisdom { margin: 1mm 0 0; padding: 2mm 3mm; border: 1px solid #ccc; border-radius: 2mm; background: #fafafa; white-space: pre-wrap;
+          font: 8pt/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; page-break-inside: avoid; break-inside: avoid; }
+.lessons { margin: 1mm 0 0; padding-left: 5mm; } .lessons li { margin: 0.8mm 0; }
 .disclaimer { margin-top: 8mm; padding-top: 3mm; border-top: 1px solid #888; font-size: 8.5pt; color: #444; page-break-inside: avoid; break-inside: avoid; }
 @media screen and (max-width: 640px) { .grid { grid-template-columns: repeat(2, 1fr); } }
 @media print { .no-print { display: none !important; } body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } .page { padding: 0; } }
@@ -1251,6 +1649,21 @@ def render_report(S):
     out.append("".join(f'<div class="note"><b>Turn {n["turn"]}:</b> {e(n["note"])}</div>' for n in s["last_notes"])
                or '<div class="sub">The agent wrote no notes.</div>')
 
+    out.append("<h2>Memory and lessons</h2>")
+    out.append(f'<div class="sub">Cross-life learning was <b>{"ON" if s["learning"] else "OFF"}</b> for this life.</div>')
+    if s["wisdom_at_start"]:
+        out.append('<div class="sub" style="margin-top:2mm">Wisdom this life started with (added to its system prompt):</div>'
+                   f'<pre class="wisdom">{e(s["wisdom_at_start"])}</pre>')
+    elif s["learning"]:
+        out.append('<div class="sub">No lessons from earlier lives existed yet, so it started without wisdom.</div>')
+    if s["lessons"]:
+        out.append('<div class="sub" style="margin-top:2mm">Lessons the agent wrote when this life ended:</div><ol class="lessons">'
+                   + "".join(f'<li>{e(x["lesson"])}</li>' for x in s["lessons"]) + "</ol>")
+    elif s["status"] == "ALIVE":
+        out.append('<div class="sub" style="margin-top:2mm">The agent reflects when this life ends.</div>')
+    else:
+        out.append('<div class="sub" style="margin-top:2mm">This life taught no lessons'
+                   + ("" if s["learning"] else " (memory was off, so no reflection ran)") + ".</div>")
     out.append('<div class="break"></div><h2>All trades</h2>')
     if S["trades"]:
         out.append('<table><colgroup><col style="width:15%"><col style="width:5%"><col style="width:8%"><col style="width:7%">'
@@ -1315,6 +1728,7 @@ def csv_bytes(header, rows, delim=","):
 def build_export_zip(con, S, delim=","):
     s, bot_id = S["summary"], S["bot"]["id"]
     csv_b = lambda header, rows: csv_bytes(header, rows, delim)
+    core_texts = {c["lesson"] for c in load_core(con)}
     files = {
         "trades.csv": csv_b(
             ["id", "ts", "turn", "action", "symbol", "qty", "price", "usd", "fee", "cash_after", "qty_after", "reason"],
@@ -1332,6 +1746,9 @@ def build_export_zip(con, S, delim=","):
             ["symbol", "qty", "avg_cost", "price", "value", "pl_pct", "valued_at_cost"],
             [[h["symbol"], h["qty"], h["avg_cost"], h["price"], h["value"], h["pl_pct"], h["valued_at_cost"]]
              for h in s["holdings"]]),
+        "lessons.csv": csv_b(
+            ["life_id", "lesson", "created", "in_current_core_wisdom"],
+            [[bot_id, x["lesson"], x["created"], x["lesson"] in core_texts] for x in s["lessons"]]),
         "news.csv": csv_b(
             ["published", "source", "title", "link", "tags"],
             [[n["published"], n["source"], n["title"], n["link"], n["tags"]] for n in con.execute(
@@ -1347,6 +1764,255 @@ def build_export_zip(con, S, delim=","):
     return name, buf.getvalue()
 
 
+# ───────────────────────── export: all lives ─────────────────────────
+def cause_text(S):
+    """Why a life ended, from the ledger (a death gets a cause; other lives get their end reason)."""
+    s = S["summary"]
+    if s["status"] == "ALIVE":
+        return "still running"
+    if s["status"] == "ENDED":
+        return "ended: model changed" if s.get("end_reason") == "model change" else "ended by a restart"
+    parts = []
+    if s["all_in"]:
+        parts.append(f"went all-in on {base_of(s['all_in']['symbol'])} (turn {s['all_in']['turn']})")
+    losers = [c for c in s["coin_results"] if c["net"] < 0]
+    if losers:
+        parts.append(f"biggest loss {base_of(losers[0]['symbol'])} {losers[0]['net']:+.2f}")
+    if not parts:
+        parts.append(f"slow bleed, fees ${s['trades']['fees_paid']:.2f}")
+    return f"died at ${s['final_value']:.2f}: " + "; ".join(parts)
+
+
+def all_lives_data(con, cfg, market):
+    """Stats for every life plus the totals, memory ON vs OFF comparison and how the core lessons evolved."""
+    lives = [life_stats(con, cfg, market, r["id"]) for r in con.execute("SELECT id FROM bots ORDER BY id")]
+    rows = [S["summary"] for S in lives]
+    for S in lives:
+        S["summary"]["cause"] = cause_text(S)
+    played = [r for r in rows if r["turns"] > 0]
+
+    def group(items):
+        if not items:
+            return {"lives": 0, "deaths": 0, "avg_survival_seconds": None, "avg_pl_pct": None, "best_pl_pct": None}
+        return {"lives": len(items), "deaths": sum(r["status"] == "DEAD" for r in items),
+                "avg_survival_seconds": sum(r["duration_seconds"] for r in items) / len(items),
+                "avg_pl_pct": sum(r["pl_pct"] for r in items) / len(items), "best_pl_pct": max(r["pl_pct"] for r in items)}
+
+    snaps, prev, steps = [], [], []
+    for r in con.execute("SELECT life_id, created, core FROM core_history ORDER BY id"):
+        try:
+            snaps.append((r["life_id"], r["created"], json.loads(r["core"])))
+        except ValueError:
+            continue
+    for life_id, created, core in snaps:                    # diff each snapshot against the one before it
+        old, new = {c["lesson"] for c in prev}, {c["lesson"] for c in core}
+        steps.append({"after_life": life_id, "created": created, "size": len(core),
+                      "added": [c for c in core if c["lesson"] not in old], "dropped": [c for c in prev if c["lesson"] not in new]})
+        prev = core
+    written = {r["life_id"]: r["n"] for r in con.execute("SELECT life_id, COUNT(*) n FROM lessons GROUP BY life_id")}
+    agg = {
+        "generated": now_iso(), "lives": len(rows), "deaths": sum(r["status"] == "DEAD" for r in rows),
+        "ended_by_restart": sum(r["status"] == "ENDED" for r in rows), "running": sum(r["status"] == "ALIVE" for r in rows),
+        "total_runtime_seconds": sum(r["duration_seconds"] for r in rows), "total_turns": sum(r["turns"] for r in rows),
+        "total_trades": sum(r["trades"]["count"] for r in rows), "total_fees": sum(r["trades"]["fees_paid"] for r in rows),
+        "longest_survival": max(rows, key=lambda r: r["duration_seconds"]) if rows else None,
+        "best_life": max(played, key=lambda r: r["pl_pct"]) if played else None,
+        "worst_life": min(played, key=lambda r: r["pl_pct"]) if played else None,
+        "memory_on": group([r for r in rows if r["learning"] and r["turns"] > 0]),
+        "memory_off": group([r for r in rows if not r["learning"] and r["turns"] > 0]),
+        "lessons_written_per_life": written, "core_now": load_core(con), "core_evolution": steps,
+    }
+    return {"lives": lives, "agg": agg}
+
+
+def svg_lives_chart(rows):
+    """Survival time (bars) and final value as a % of start cash (dots and a dashed line) for every life.
+    Percent keeps lives with different start cash comparable. Print-safe inline SVG."""
+    W, H, L, R, T, B = 720, 270, 60, 62, 30, 34
+    n = len(rows)
+    if not n:
+        return ""
+    secs = [r["duration_seconds"] for r in rows]
+    unit, div = ("hours", 3600.0) if max(secs) > 3 * 3600 else ("minutes", 60.0)
+    bars = [s / div for s in secs]
+    pct = [r["final_value"] / r["settings"]["start_cash"] * 100 if r["settings"]["start_cash"] else 100.0 for r in rows]
+    bmax = max(max(bars), 1e-9) * 1.1
+    plo, phi = min(min(pct), 100.0), max(max(pct), 100.0)
+    pad = (phi - plo) * 0.12 or 2.0
+    plo, phi = plo - pad, phi + pad
+    slot = (W - L - R) / n
+    bw = min(34.0, slot * 0.6)
+    X = lambda i: L + slot * (i + 0.5)
+    YB = lambda v: T + (1 - v / bmax) * (H - T - B)
+    YP = lambda v: T + (phi - v) / (phi - plo) * (H - T - B)
+    color = {"DEAD": "#b42318", "ENDED": "#8c929a", "ALIVE": "#2f2fb8"}
+    out = [f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" role="img" font-family="Arial, sans-serif" font-size="10" '
+           f'aria-label="Survival time and final value per life">']
+    for k in range(5):
+        v = bmax * k / 4
+        out.append(f'<line x1="{L}" x2="{W - R}" y1="{YB(v):.1f}" y2="{YB(v):.1f}" stroke="#e3e3e3"/>'
+                   f'<text x="{L - 6}" y="{YB(v) + 3:.1f}" text-anchor="end" fill="#555">{v:.3g}</text>')
+        pv = plo + (phi - plo) * k / 4
+        out.append(f'<text x="{W - R + 6}" y="{YP(pv) + 3:.1f}" fill="#c77700">{pv:.0f}%</text>')
+    out.append(f'<text x="{L}" y="14" fill="#555">Survival time ({unit})</text>'
+               f'<text x="{W - R}" y="14" text-anchor="end" fill="#c77700">Final value, % of start cash</text>')
+    out.append(f'<line x1="{L}" x2="{W - R}" y1="{YP(100):.1f}" y2="{YP(100):.1f}" stroke="#c77700" stroke-width="0.8" stroke-dasharray="2 4"/>')
+    for i, r in enumerate(rows):
+        h = (H - B) - YB(bars[i])
+        out.append(f'<rect x="{X(i) - bw / 2:.1f}" y="{YB(bars[i]):.1f}" width="{bw:.1f}" height="{max(h, 0.5):.1f}" '
+                   f'fill="{color[r["status"]]}" opacity="0.85"/>'
+                   f'<text x="{X(i):.1f}" y="{H - 18}" text-anchor="middle" fill="#222">#{r["life_id"]}{chr(9733) if r["learning"] else ""}</text>')
+    pts = " ".join(f"{X(i):.1f},{YP(v):.1f}" for i, v in enumerate(pct))
+    if n > 1:
+        out.append(f'<polyline fill="none" stroke="#c77700" stroke-width="1.6" stroke-dasharray="6 3" points="{pts}"/>')
+    for i, v in enumerate(pct):
+        out.append(f'<circle cx="{X(i):.1f}" cy="{YP(v):.1f}" r="3.4" fill="#fff" stroke="#c77700" stroke-width="1.8"/>')
+    lx = L
+    for label, c in (("died", color["DEAD"]), ("ended by restart", color["ENDED"]), ("running", color["ALIVE"])):
+        out.append(f'<rect x="{lx}" y="{H - 9}" width="9" height="8" fill="{c}" opacity="0.85"/><text x="{lx + 13}" y="{H - 2}" fill="#222">{label}</text>')
+        lx += 20 + len(label) * 5.6
+    out.append(f'<text x="{lx + 6}" y="{H - 2}" fill="#222">{chr(9733)} memory on · dots = final value</text></svg>')
+    return "".join(out)
+
+
+def render_all_report(A, bot_name):
+    e = html.escape
+    lives, agg = A["lives"], A["agg"]
+    rows = [S["summary"] for S in lives]
+    money = lambda x: ("-" if x < 0 else "") + f"${abs(x):,.2f}"
+    cls = lambda x: "pos" if x >= 0 else "neg"
+
+    def box(k, v, sub=""):
+        return f'<div class="box"><div class="k">{e(k)}</div><div class="v">{v}</div><div class="s">{sub}</div></div>'
+
+    def life_ref(r):
+        return (f'Life #{r["life_id"]}: <span class="{cls(r["pl_pct"])}">{r["pl_pct"]:+.1f}%</span>',
+                f'{money(r["final_value"])} from {money(r["settings"]["start_cash"])}, {e(short_duration(r["duration_seconds"]))}, memory {"ON" if r["learning"] else "OFF"}')
+
+    def group_row(label, g):
+        if not g["lives"]:
+            return f"<tr><td>{label}</td><td class=\"r\">0</td><td class=\"r\">-</td><td class=\"r\">-</td><td class=\"r\">-</td><td class=\"r\">-</td></tr>"
+        return (f'<tr><td>{label}</td><td class="r">{g["lives"]}</td><td class="r">{g["deaths"]}</td>'
+                f'<td class="r">{e(short_duration(g["avg_survival_seconds"]))}</td>'
+                f'<td class="r {cls(g["avg_pl_pct"])}">{g["avg_pl_pct"]:+.1f}%</td><td class="r {cls(g["best_pl_pct"])}">{g["best_pl_pct"]:+.1f}%</td></tr>')
+
+    out = [f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
+           f'<title>{e(bot_name)} - all lives report</title><style>{REPORT_CSS}</style></head><body><div class="page">',
+           '<div class="bar no-print"><span class="sub">Use your browser\'s print dialog: paper size A4, margins default.</span>'
+           '<button class="btn" type="button" onclick="window.print()">Print / Save as PDF</button></div>',
+           f'<h1>{e(bot_name)} — all lives report</h1>',
+           f'<div class="sub">{agg["lives"]} lives in the ledger &middot; generated {e(fmt_when(agg["generated"]))}</div>']
+
+    out.append("<h2>Overview</h2><div class=\"grid\">"
+               + box("Lives", str(agg["lives"]), f'{agg["running"]} running, {agg["ended_by_restart"]} ended by a restart')
+               + box("Deaths", str(agg["deaths"]), "total value fell below the death line")
+               + box("Total runtime", e(fmt_duration(agg["total_runtime_seconds"])), f'{agg["total_turns"]} turns')
+               + box("Trades", str(agg["total_trades"]), f'fees paid {money(agg["total_fees"])}')
+               + (box("Best life", *life_ref(agg["best_life"])) if agg["best_life"] else box("Best life", "n/a"))
+               + (box("Worst life", *life_ref(agg["worst_life"])) if agg["worst_life"] else box("Worst life", "n/a"))
+               + (box("Longest survival", f'Life #{agg["longest_survival"]["life_id"]}',
+                      e(short_duration(agg["longest_survival"]["duration_seconds"]))) if agg["longest_survival"] else "")
+               + "</div>")
+
+    out.append("<h2>Survival time and final value per life</h2>" + svg_lives_chart(rows))
+
+    out.append('<h2>Every life</h2><table><colgroup><col style="width:5%"><col style="width:12%"><col style="width:10%"><col style="width:9%">'
+               '<col style="width:6%"><col style="width:9%"><col style="width:9%"><col style="width:12%"><col style="width:28%"></colgroup>'
+               '<thead><tr><th>Life</th><th>Model</th><th>Start / fee</th><th>Memory</th><th class="r">Turns</th><th class="r">Survived</th>'
+               '<th class="r">Peak</th><th class="r">Final</th><th>Outcome / cause of death</th></tr></thead><tbody>')
+    for r in rows:
+        out.append(f'<tr><td>#{r["life_id"]}</td><td>{e(str(r["model"]))}</td>'
+                   f'<td>{money(r["settings"]["start_cash"])}<br>{r["settings"]["fee_pct"]:.2f}%</td>'
+                   f'<td>{"ON" if r["learning"] else "OFF"}</td><td class="r">{r["turns"]}</td>'
+                   f'<td class="r">{e(short_duration(r["duration_seconds"]))}</td><td class="r">{money(r["drawdown"]["peak_value"])}</td>'
+                   f'<td class="r">{money(r["final_value"])}<br><span class="{cls(r["pl_pct"])}">{r["pl_pct"]:+.1f}%</span></td>'
+                   f'<td>{e(r["cause"])}</td></tr>')
+    out.append("</tbody></table>")
+
+    out.append("<h2>Memory on vs off</h2>"
+               '<table><colgroup><col style="width:28%"><col style="width:12%"><col style="width:12%"><col style="width:16%"><col style="width:16%"><col style="width:16%"></colgroup>'
+               '<thead><tr><th>Group (lives with at least one turn)</th><th class="r">Lives</th><th class="r">Deaths</th>'
+               '<th class="r">Avg survival</th><th class="r">Avg P/L</th><th class="r">Best P/L</th></tr></thead><tbody>'
+               + group_row("Memory ON", agg["memory_on"]) + group_row("Memory OFF", agg["memory_off"]) + "</tbody></table>"
+               '<div class="sub">Small samples prove little; compare lives that share the same model, cash, fee and death line.</div>')
+
+    out.append("<h2>How the core lessons evolved</h2>")
+    steps = agg["core_evolution"]
+    if steps:
+        out.append('<div class="sub">After each reflection the lessons are merged into at most 10 core lessons. Added lessons show the life that wrote them.</div>')
+        for st in steps:
+            out.append(f'<div class="keep" style="margin-top:2.5mm"><b>After life #{st["after_life"]}</b> '
+                       f'<span class="sub">({e(fmt_when(st["created"]))}, {st["size"]} core lessons)</span><ul class="lessons">'
+                       + "".join(f'<li><b class="pos">+</b> {e(c["lesson"])} <span class="sub">(life #{c["life"]})</span></li>' for c in st["added"])
+                       + "".join(f'<li><b class="neg">&minus;</b> <s>{e(c["lesson"])}</s> <span class="sub">(from life #{c["life"]}, dropped)</span></li>' for c in st["dropped"])
+                       + ("" if st["added"] or st["dropped"] else '<li class="sub">No change.</li>') + "</ul></div>")
+    else:
+        out.append('<div class="sub">No lesson history yet: it is recorded each time a life with memory ON ends and the agent reflects.</div>')
+    written = agg["lessons_written_per_life"]
+    if written:
+        out.append('<div class="sub" style="margin-top:3mm">Lessons written per life: '
+                   + ", ".join(f"#{k}: {v}" for k, v in sorted(written.items())) + ".</div>")
+    out.append("<h2>Core lessons now</h2>")
+    out.append('<ol class="lessons">' + "".join(f'<li>{e(c["lesson"])} <span class="sub">(life #{c["life"]})</span></li>' for c in agg["core_now"]) + "</ol>"
+               if agg["core_now"] else '<div class="sub">None yet.</div>')
+
+    out.append('<div class="disclaimer"><b>Disclaimer.</b> This is a simulation. No real money was used and no real orders were placed. '
+               'Nothing here is financial advice, and the results say nothing about how a real strategy would perform.</div>')
+    out.append("</div></body></html>")
+    return "".join(out).encode("utf-8")
+
+
+def build_all_zip(con, cfg, A, delim=","):
+    """Every CSV across all lives in one ZIP, each with a life_id column, plus lives.csv, core_history.csv and summary.json."""
+    csv_b = lambda header, rows: csv_bytes(header, rows, delim)
+    lives, agg = A["lives"], A["agg"]
+    core_texts = {c["lesson"] for c in agg["core_now"]}
+    q = lambda sql: [list(r) for r in con.execute(sql)]
+    news_rows = []
+    for S in lives:
+        for n in con.execute("SELECT published, source, title, link, tags FROM news WHERE published>=? AND published<=? ORDER BY published",
+                             (S["bot"]["started"], S["end_iso"])):
+            news_rows.append([S["bot"]["id"]] + list(n))
+    files = {
+        "lives.csv": csv_b(
+            ["life_id", "model", "started", "ended", "end_reason", "status", "memory_on", "start_cash", "fee_pct", "turns",
+             "survival_seconds", "peak_value", "final_value", "pl_usd", "pl_pct", "trades", "fees_paid", "cause", "summary"],
+            [[s["life_id"], s["model"], s["started"], s["ended"] or s["died"], s["end_reason"], s["status"], s["learning"],
+              s["settings"]["start_cash"], s["settings"]["fee_pct"], s["turns"], s["duration_seconds"], s["drawdown"]["peak_value"],
+              s["final_value"], s["pl_usd"], s["pl_pct"], s["trades"]["count"], s["trades"]["fees_paid"], s["cause"], s["life_summary"]]
+             for s in (S["summary"] for S in lives)]),
+        "trades.csv": csv_b(
+            ["life_id", "id", "ts", "turn", "action", "symbol", "qty", "price", "usd", "fee", "cash_after", "qty_after", "reason"],
+            q("SELECT bot_id, id, ts, turn, action, symbol, qty, price, usd, fee, cash_after, qty_after, reason FROM trades ORDER BY bot_id, id")),
+        "equity.csv": csv_b(
+            ["life_id", "ts", "btc_price", "cash", "positions_value", "equity"],
+            q("SELECT bot_id, ts, btc_price, cash, positions_value, equity FROM equity ORDER BY bot_id, id")),
+        "decisions.csv": csv_b(
+            ["life_id", "ts", "turn", "action", "orders", "watch", "reason", "note", "error", "thinking", "prompt_tokens",
+             "eval_tokens", "duration_seconds", "stage2_calls"],
+            q("SELECT bot_id, ts, turn, action, orders, watch, reason, note, error, thinking, prompt_tokens, eval_tokens, duration, stage2 "
+              "FROM decisions ORDER BY bot_id, id")),
+        "positions.csv": csv_b(
+            ["life_id", "symbol", "qty", "avg_cost", "price", "value", "pl_pct", "valued_at_cost"],
+            [[S["bot"]["id"], h["symbol"], h["qty"], h["avg_cost"], h["price"], h["value"], h["pl_pct"], h["valued_at_cost"]]
+             for S in lives for h in S["summary"]["holdings"]]),
+        "lessons.csv": csv_b(
+            ["life_id", "lesson", "created", "in_current_core_wisdom"],
+            [[r[0], r[1], r[2], r[1] in core_texts] for r in q("SELECT life_id, lesson, created FROM lessons ORDER BY id")]),
+        "core_history.csv": csv_b(
+            ["after_life_id", "snapshot_created", "position", "lesson", "taught_by_life_id"],
+            [[r["life_id"], r["created"], i, c["lesson"], c["life"]] for r in con.execute("SELECT life_id, created, core FROM core_history ORDER BY id")
+             for i, c in enumerate(json.loads(r["core"]), 1)]),
+        "news.csv": csv_b(["life_id", "published", "source", "title", "link", "tags"], news_rows),
+        "summary.json": json.dumps({"overview": agg, "lives": [S["summary"] for S in lives]}, indent=2, ensure_ascii=False, default=str).encode("utf-8"),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in files.items():
+            z.writestr(name, data)
+    return f"arena_all_lives_{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.zip", buf.getvalue()
+
+
 def build_runs(cfg, market):
     """Every life, newest first: start cash, fee, turns, final value and whether it died or was ended."""
     con = connect(cfg.db)
@@ -1360,9 +2026,12 @@ def build_runs(cfg, market):
             if is_current and b["alive"]:
                 value = total_value(b["cash"], load_positions(con, b["id"]), market.prices)
             status = "died" if not b["alive"] else ("running" if is_current and not b["ended"] else "ended")
+            t_start, t_end = parse_ts(b["started"]), parse_ts(b["ended"] or b["died"]) or datetime.now(timezone.utc)
             out.append({"id": b["id"], "model": b["model"], "started": b["started"], "ended": b["ended"] or b["died"],
                         "start_cash": b["start_cash"], "fee_pct": (b["fee_rate"] or 0) * 100, "turns": b["ticks"],
-                        "final_value": value, "status": status, "current": is_current})
+                        "final_value": value, "status": status, "current": is_current,
+                        "learning": bool(b["learning"]), "summary": b["summary"],
+                        "duration_seconds": round((t_end - t_start).total_seconds()) if t_start else 0})
         return out
     finally:
         con.close()
@@ -1408,6 +2077,15 @@ def build_state(cfg, market, mood):
             "settings": {"start_cash": float(get_setting(con, "start_cash") or bot["start_cash"]),
                          "fee_pct": float(get_setting(con, "fee_pct") or bot["fee_rate"] * 100)},
             "restart_pending": RESTART_REQ["req"], "lan": cfg.lan,
+            "memory": {
+                "learning_this_life": bool(bot["learning"]), "learning_next": get_toggle(con, "learning"),
+                "auto_restart": get_toggle(con, "auto_restart"), "max_lives": cfg.max_lives,
+                "lives": con.execute("SELECT COUNT(*) FROM bots").fetchone()[0],
+                "deaths": con.execute("SELECT COUNT(*) FROM bots WHERE alive=0").fetchone()[0],
+                "core_lessons": load_core(con), "phase": AGENT["phase"], "reflecting_life": AGENT["reflecting_life"],
+                "next_life_in": max(0, round(AGENT["next_life_at"] - time.time())) if AGENT["next_life_at"] else None,
+                "wisdom": bot.get("wisdom") or "",
+            },
             "mood": {"fng": mood.fng, "trending": mood.trending},
             "equity": eq, "trades": trades, "decisions": decisions, "news": news,
         }
@@ -1434,18 +2112,40 @@ def make_handler(cfg, market, mood):
                     self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
             elif path in ("/api/report", "/api/export.zip"):
                 self._export(path)
+            elif path in ("/api/report/all", "/api/export_all.zip"):
+                self._export_all(path)
             else:
                 self._send(404, b"not found", "text/plain")
 
-        def _local_error(self):
-            """Same access rule as restart: loopback only (and a sane Host header) unless --lan is set."""
-            if cfg.lan:
+        def _local_error(self, strict=False):
+            """Same access rule as restart: loopback only (and a sane Host header) unless --lan is set.
+            strict=True ignores --lan: some things are never allowed from the network."""
+            if cfg.lan and not strict:
                 return None
             if self.client_address[0] not in LOOPBACK:
                 return "only accepted from localhost (start with --lan to allow your network)"
             if (urllib.parse.urlsplit("//" + (self.headers.get("Host") or "")).hostname or "") not in ("localhost", "127.0.0.1", "::1"):
                 return "unexpected Host header"
             return None
+
+        def _export_all(self, path):
+            """One report / one ZIP covering every life. Read-only, same access rule as the other exports."""
+            err = self._local_error()
+            if err:
+                return self._json(403, {"error": "exports are " + err})
+            con = open_readonly(cfg)
+            try:
+                A = all_lives_data(con, cfg, market)
+                if path == "/api/report/all":
+                    return self._send(200, render_all_report(A, cfg.bot_name), "text/html; charset=utf-8")
+                sep = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("sep", [None])[0]
+                delim = {"comma": ",", "semicolon": ";"}.get(sep, cfg.csv_sep)
+                name, data = build_all_zip(con, cfg, A, delim)
+                self._send(200, data, "application/zip", {"Content-Disposition": f'attachment; filename="{name}"'})
+            except Exception as e:
+                self._json(500, {"error": f"export failed: {e}"})
+            finally:
+                con.close()
 
         def _export(self, path):
             err = self._local_error()
@@ -1479,28 +2179,70 @@ def make_handler(cfg, market, mood):
         def _json(self, code, obj):
             self._send(code, json.dumps(obj).encode(), "application/json")
 
-        def do_POST(self):
-            if self.path.split("?")[0] != "/api/restart":
-                return self._json(404, {"error": "not found"})
-            # Same-origin, JSON-only, localhost-only (unless --lan): a random web page can't trigger a restart.
-            err = self._local_error()
+        def _json_body(self, strict=False):
+            """Checks shared by every POST: same-origin, JSON-only, localhost-only (unless --lan), small body.
+            A random web page can't change anything. strict=True (used by shutdown) is localhost-only even with --lan.
+            Returns the parsed dict, or None after sending an error."""
+            err = self._local_error(strict)
             if err:
-                return self._json(403, {"error": "restart is " + err if err.startswith("only") else err})
+                self._json(403, {"error": "changes are " + err if err.startswith("only") else err})
+                return None
             origin = self.headers.get("Origin")
             if origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host"):
-                return self._json(403, {"error": "cross-origin request refused"})
+                self._json(403, {"error": "cross-origin request refused"})
+                return None
             if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
-                return self._json(415, {"error": "Content-Type must be application/json"})
+                self._json(415, {"error": "Content-Type must be application/json"})
+                return None
             try:
                 n = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 n = -1
             if not 0 < n <= 1024:
-                return self._json(413, {"error": "bad body size"})
+                self._json(413, {"error": "bad body size"})
+                return None
             try:
                 body = json.loads(self.rfile.read(n))
+            except ValueError:
+                body = None
+            if not isinstance(body, dict):
+                self._json(400, {"error": "body must be a JSON object"})
+                return None
+            return body
+
+        def _settings(self, body):
+            """POST /api/settings {"learning": bool, "auto_restart": bool}: either or both. Auto-restart applies at the
+            next death; learning applies from the next life (a life never changes its memory halfway)."""
+            known = {k: body[k] for k in ("learning", "auto_restart") if k in body}
+            if not known or any(not isinstance(v, bool) for v in known.values()):
+                return self._json(400, {"error": "send {\"learning\": true/false} and/or {\"auto_restart\": true/false}"})
+            con = connect(cfg.db)
+            try:
+                for k, v in known.items():
+                    set_toggle(con, k, v)
+                con.commit()
+                out = {"learning": get_toggle(con, "learning"), "auto_restart": get_toggle(con, "auto_restart")}
+            finally:
+                con.close()
+            WAKE.set()                                      # let a waiting auto-restart notice the change at once
+            self._json(200, {"ok": True, **out})
+
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if path not in ("/api/restart", "/api/settings", "/api/shutdown"):
+                return self._json(404, {"error": "not found"})
+            body = self._json_body(strict=(path == "/api/shutdown"))
+            if body is None:
+                return
+            if path == "/api/shutdown":
+                self._json(200, {"ok": True, "stopping": True})
+                threading.Thread(target=graceful_exit, args=("Shutdown requested",), daemon=True).start()
+                return
+            if path == "/api/settings":
+                return self._settings(body)
+            try:
                 start_cash, fee_pct = body["start_cash"], body["fee_pct"]
-            except (ValueError, KeyError, TypeError):
+            except (KeyError, TypeError):
                 return self._json(400, {"error": "body must be JSON like {\"start_cash\": 50, \"fee_pct\": 0.1}"})
             for v in (start_cash, fee_pct):
                 if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
@@ -1571,6 +2313,16 @@ def main():
                     help="max reasoning tokens before the answer is forced into the JSON schema (0 = skip reasoning)")
     ap.add_argument("--csv-delimiter", choices=["auto", "comma", "semicolon"], default="auto",
                     help="CSV export style. auto follows your regional settings: a decimal comma means ';' columns and decimal commas (what Excel expects)")
+    ap.add_argument("--learning", nargs="?", const="on", choices=["on", "off"], default=None,
+                    help="cross-life memory: when a life ends the agent reflects, and later lives start with its lessons "
+                         "(default on). Only changes the saved setting when you pass it; the dashboard toggle also edits it. "
+                         "Applies from the next life, so compare 'off' and 'on' runs fairly")
+    ap.add_argument("--auto-restart", nargs="?", const="on", choices=["on", "off"], default=None,
+                    help="when the agent dies: reflect, wait --restart-delay seconds, then start a new life with the same "
+                         "settings and model (default on; saved setting, also a dashboard toggle)")
+    ap.add_argument("--max-lives", type=int, default=20,
+                    help="auto-restart stops once the ledger holds this many lives (default 20)")
+    ap.add_argument("--restart-delay", type=float, default=60, help="seconds to wait before an auto-restart (default 60)")
     ap.add_argument("--mock", action="store_true", help="no LLM, random multi-coin orders (to test the dashboard)")
     cfg = ap.parse_args()
     cfg.fee_rate = cfg.fee_pct / 100
@@ -1597,7 +2349,11 @@ def main():
     mood.update()
     con = init_db(cfg.db)
     sync_settings(con, cfg)
+    sync_toggles(con, cfg)
     fetch_news(con, market.universe)
+    print(f"Memory (cross-life learning): {'ON' if get_toggle(con, 'learning') else 'OFF'} for the next life | "
+          f"auto-restart after death: {'ON' if get_toggle(con, 'auto_restart') else 'OFF'} "
+          f"(wait {cfg.restart_delay:g}s, at most {cfg.max_lives} lives) | core lessons stored: {len(load_core(con))}")
     con.close()
 
     print(f"Tradable universe ({len(market.universe)} coins, sorted by 24h volume; '*' = under the "
@@ -1617,6 +2373,19 @@ def main():
     print(f"Bot: {cfg.bot_name} | model: {'mock' if cfg.mock else cfg.model} | market: {market.label} "
           f"({len(market.universe)} coins) | next life: start ${cfg.start_cash:.2f}, fee {cfg.fee_pct:g}% "
           f"| a turn every {cfg.interval:g}s | Ctrl+C to stop\n")
+
+    RUNTIME["db"] = cfg.db
+
+    def on_signal(signum, frame):
+        # Ctrl+C, a plain `kill`, or closing the console: stop through the same graceful path as /api/shutdown.
+        threading.Thread(target=graceful_exit, args=(f"Signal {signum} received",), daemon=True).start()
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), on_signal)
+            except (ValueError, OSError):
+                pass
 
     try:
         run_sim(cfg, market, mood)
