@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Trading Arena</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:#f5f6f8; --panel:#ffffff; --text:#14171c; --muted:#667085; --border:#e4e7ec;
+    --green:#12a150; --red:#d92d20; --accent:#4f46e5; --price:#a0a8b8; --chip:#eef0f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#8b949e; --border:#2a313b;
+      --green:#3fb950; --red:#f85149; --accent:#8b8cf8; --price:#5c6570; --chip:#21262d;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:20px 16px 40px; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; margin-bottom:16px; }
+  h1 { font-size:22px; margin:0; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; }
+  .pill { font-size:12px; font-weight:600; padding:3px 10px; border-radius:999px; }
+  .alive { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .dead  { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .conn { margin-left:auto; color:var(--muted); font-size:12px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:14px; }
+  .card, .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+  .card { padding:12px 14px; }
+  .card .k { color:var(--muted); font-size:12px; }
+  .card .v { font-size:20px; font-weight:650; margin-top:2px; font-variant-numeric:tabular-nums; }
+  .card .s { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  .panel { padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:14px; margin:0 0 10px; display:flex; justify-content:space-between; align-items:baseline; }
+  .panel h2 span { color:var(--muted); font-weight:400; font-size:12px; }
+  .chartbox { position:relative; height:320px; }
+  .grid2 { display:grid; grid-template-columns:3fr 2fr; gap:14px; }
+  @media (max-width:900px) { .grid2 { grid-template-columns:1fr; } .chartbox { height:260px; } }
+  .tablewrap { overflow-x:auto; max-height:460px; overflow-y:auto; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); white-space:nowrap; font-size:13px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; position:sticky; top:0; background:var(--panel); }
+  td.reason { white-space:normal; min-width:220px; color:var(--muted); }
+  .badge { font-size:11px; font-weight:700; padding:2px 7px; border-radius:6px; letter-spacing:.03em; }
+  .BUY, .buy { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .SELL, .sell { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .hold { background:var(--chip); color:var(--muted); }
+  .feed { max-height:460px; overflow-y:auto; }
+  .item { padding:9px 0; border-bottom:1px solid var(--border); }
+  .item:last-child { border-bottom:0; }
+  .item .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; }
+  .item .r { margin-top:3px; }
+  .item .n { margin-top:3px; font-size:12px; color:var(--accent); }
+  .item .e { margin-top:3px; font-size:12px; color:var(--red); }
+  .empty { color:var(--muted); padding:16px 0; text-align:center; }
+  .rules { color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title">LLM Trading Arena</h1>
+    <span id="status" class="pill alive">…</span>
+    <span id="sub" class="sub"></span>
+    <span id="conn" class="conn">Connecting…</span>
+  </header>
+
+  <div class="cards">
+    <div class="card"><div class="k">Total value</div><div class="v" id="c-eq">–</div><div class="s" id="c-eq-s"></div></div>
+    <div class="card"><div class="k">Profit / loss</div><div class="v" id="c-pl">–</div><div class="s" id="c-pl-s"></div></div>
+    <div class="card"><div class="k">Cash</div><div class="v" id="c-cash">–</div><div class="s" id="c-cash-s"></div></div>
+    <div class="card"><div class="k">Holdings</div><div class="v" id="c-hold">–</div><div class="s" id="c-hold-s"></div></div>
+    <div class="card"><div class="k">Price</div><div class="v" id="c-price">–</div><div class="s" id="c-price-s"></div></div>
+    <div class="card"><div class="k">Turns survived</div><div class="v" id="c-turns">–</div><div class="s" id="c-turns-s"></div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Money over time <span id="rules" class="rules"></span></h2>
+    <div class="chartbox"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>Trades <span id="tcount"></span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Time</th><th>Turn</th><th>Action</th><th>Qty</th><th>Price</th><th>Value</th><th>Fee</th><th>Cash after</th><th>Why</th></tr></thead>
+          <tbody id="trades"><tr><td colspan="9" class="empty">No trades yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Its thoughts <span>latest decisions</span></h2>
+      <div class="feed" id="feed"><div class="empty">Waiting for the first turn…</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const money = x => (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+const pricef = p => p >= 1 ? p.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) : p.toFixed(6);
+const qtyf = q => q === 0 ? '0' : (q < 0.01 ? q.toFixed(8) : q.toFixed(4));
+const tfmt = ts => new Date(ts).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+const tshort = ts => new Date(ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cssv = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const signCls = x => x >= 0 ? 'pos' : 'neg';
+
+let chart = null;
+function initChart() {
+  if (typeof Chart === 'undefined') {
+    $('.chartbox').innerHTML = '<div class="empty">Chart library didn\'t load (no internet?). Tables still update.</div>';
+    return;
+  }
+  chart = new Chart($('#chart'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Total value ($)', data: [], borderColor: cssv('--accent'), borderWidth: 2, tension: .2,
+        pointRadius: [], pointBackgroundColor: [], pointBorderColor: [], yAxisID: 'y' },
+      { label: 'Starting cash', data: [], borderColor: cssv('--muted'), borderDash: [4,4], borderWidth: 1, pointRadius: 0, yAxisID: 'y' },
+      { label: 'Price', data: [], borderColor: cssv('--price'), borderWidth: 1, pointRadius: 0, tension: .2, yAxisID: 'y2' },
+    ]},
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: cssv('--muted'), boxWidth: 12, boxHeight: 2 } },
+        tooltip: { callbacks: { label: c => c.dataset.yAxisID === 'y2' ? ` Price ${pricef(c.parsed.y)}` : ` ${c.dataset.label}: ${money(c.parsed.y)}` } },
+      },
+      scales: {
+        x:  { ticks: { color: cssv('--muted'), maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } },
+        y:  { position: 'left', ticks: { color: cssv('--muted'), callback: v => '$' + v }, grid: { color: cssv('--border') } },
+        y2: { position: 'right', ticks: { color: cssv('--muted'), callback: v => pricef(v) }, grid: { display: false } },
+      },
+    },
+  });
+}
+
+function renderChart(s) {
+  if (!chart) return;
+  const buys = new Set(s.trades.filter(t => t.action === 'BUY').map(t => t.ts));
+  const sells = new Set(s.trades.filter(t => t.action === 'SELL').map(t => t.ts));
+  const g = cssv('--green'), r = cssv('--red'), a = cssv('--accent');
+  const ds = chart.data.datasets;
+  chart.data.labels = s.equity.map(e => tshort(e.ts));
+  ds[0].data = s.equity.map(e => e.equity);
+  ds[0].pointRadius = s.equity.map(e => buys.has(e.ts) || sells.has(e.ts) ? 4 : 0);
+  ds[0].pointBackgroundColor = s.equity.map(e => buys.has(e.ts) ? g : sells.has(e.ts) ? r : a);
+  ds[0].pointBorderColor = ds[0].pointBackgroundColor;
+  ds[1].data = s.equity.map(() => s.config.start_cash);
+  ds[2].data = s.equity.map(e => e.price);
+  chart.update();
+}
+
+function render(s) {
+  const b = s.bot, c = s.config, eq = s.equity_now;
+  const pl = eq - c.start_cash, plp = pl / c.start_cash * 100;
+  document.title = `${b.name} ${money(eq)} · LLM Trading Arena`;
+  $('#title').textContent = b.name;
+  const st = $('#status');
+  st.textContent = b.alive ? 'ALIVE' : 'DEAD';
+  st.className = 'pill ' + (b.alive ? 'alive' : 'dead');
+  $('#sub').textContent = `${b.model} · trading ${c.market}`;
+  $('#rules').textContent = `start ${money(c.start_cash)} · fee ${(c.fee_rate*100).toFixed(2)}% · dies below ${money(c.death_line)}` +
+    (c.living_cost > 0 ? ` · living cost ${money(c.living_cost)}/turn` : '');
+
+  $('#c-eq').textContent = money(eq);
+  $('#c-eq-s').textContent = `${money(eq - c.death_line)} above death`;
+  $('#c-pl').textContent = (pl >= 0 ? '+' : '') + money(pl);
+  $('#c-pl').className = 'v ' + signCls(pl);
+  $('#c-pl-s').textContent = (plp >= 0 ? '+' : '') + plp.toFixed(2) + '% vs start';
+  $('#c-cash').textContent = money(b.cash);
+  $('#c-cash-s').textContent = `fees paid ${money(s.fees_paid)}`;
+  $('#c-hold').textContent = money(b.qty * s.price);
+  $('#c-hold-s').textContent = `${qtyf(b.qty)} ${c.asset}`;
+  $('#c-price').textContent = pricef(s.price);
+  const first = s.equity.length ? s.equity[0].price : s.price;
+  const mch = (s.price / first - 1) * 100;
+  $('#c-price-s').innerHTML = `<span class="${signCls(mch)}">${mch >= 0 ? '+' : ''}${mch.toFixed(2)}%</span> since start (buy &amp; hold)`;
+  $('#c-turns').textContent = b.ticks;
+  $('#c-turns-s').textContent = b.alive ? `a turn every ${c.interval}s` : `died ${tfmt(b.died)}`;
+
+  $('#tcount').textContent = `${s.trade_count} total`;
+  $('#trades').innerHTML = s.trades.length ? s.trades.map(t => `
+    <tr>
+      <td>${tfmt(t.ts)}</td><td>${t.turn}</td>
+      <td><span class="badge ${t.action}">${t.action}</span></td>
+      <td>${qtyf(t.qty)}</td><td>${pricef(t.price)}</td><td>${money(t.usd)}</td>
+      <td>${money(t.fee)}</td><td>${money(t.cash_after)}</td>
+      <td class="reason">${esc(t.reason)}</td>
+    </tr>`).join('') : '<tr><td colspan="9" class="empty">No trades yet</td></tr>';
+
+  $('#feed').innerHTML = s.decisions.length ? s.decisions.map(d => `
+    <div class="item">
+      <div class="meta"><span class="badge ${d.action}">${d.action.toUpperCase()}</span>turn ${d.turn} · ${tfmt(d.ts)}</div>
+      ${d.reason ? `<div class="r">${esc(d.reason)}</div>` : ''}
+      ${d.note ? `<div class="n">Note to self: ${esc(d.note)}</div>` : ''}
+      ${d.error ? `<div class="e">${esc(d.error)}</div>` : ''}
+    </div>`).join('') : '<div class="empty">Waiting for the first turn…</div>';
+
+  renderChart(s);
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/state', { cache: 'no-store' });
+    const s = await res.json();
+    if (s.ready) render(s);
+    $('#conn').textContent = 'Live · updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('#conn').textContent = 'Disconnected. Is arena.py running?';
+  }
+}
+
+initChart();
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

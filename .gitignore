@@ -1,0 +1,28 @@
+# Ledgers and run output (these can contain your run history)
+*.db
+*.db-wal
+*.db-shm
+*.err
+*.log
+*.out
+arena.txt
+nohup.out
+*.tmp
+
+# Local backups and old experiments
+*_backup.*
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets (this project needs none, but just in case)
+.env
+.env.*
+
+# Editors, OS and tooling
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db

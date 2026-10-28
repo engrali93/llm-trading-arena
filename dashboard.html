@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Trading Arena</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:#f5f6f8; --panel:#ffffff; --text:#14171c; --muted:#667085; --border:#e4e7ec;
+    --green:#12a150; --red:#d92d20; --accent:#4f46e5; --price:#d98a1a; --chip:#eef0f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1117; --panel:#161b22; --text:#e6edf3; --muted:#8b949e; --border:#2a313b;
+      --green:#3fb950; --red:#f85149; --accent:#8b8cf8; --price:#e3a63f; --chip:#21262d;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:20px 16px 40px; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; margin-bottom:16px; }
+  h1 { font-size:22px; margin:0; letter-spacing:-.01em; }
+  .sub { color:var(--muted); font-size:13px; }
+  .pill { font-size:12px; font-weight:600; padding:3px 10px; border-radius:999px; }
+  .alive { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .dead  { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .conn { margin-left:auto; color:var(--muted); font-size:12px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; margin-bottom:14px; }
+  .card, .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px; }
+  .card { padding:12px 14px; }
+  .card .k { color:var(--muted); font-size:12px; }
+  .card .v { font-size:20px; font-weight:650; margin-top:2px; font-variant-numeric:tabular-nums; }
+  .card .s { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  .panel { padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:14px; margin:0 0 10px; display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .panel h2 span { color:var(--muted); font-weight:400; font-size:12px; }
+  .chartbox { position:relative; height:320px; }
+  .donutbox { position:relative; height:190px; }
+  .grid2 { display:grid; grid-template-columns:3fr 2fr; gap:14px; }
+  .grid3 { display:grid; grid-template-columns:3fr 2fr; gap:14px; }
+  @media (max-width:900px) { .grid2, .grid3 { grid-template-columns:1fr; } .chartbox { height:260px; } }
+  .tablewrap { overflow-x:auto; max-height:460px; overflow-y:auto; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); white-space:nowrap; font-size:13px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; position:sticky; top:0; background:var(--panel); }
+  td.reason { white-space:normal; min-width:220px; color:var(--muted); }
+  .badge { font-size:11px; font-weight:700; padding:2px 7px; border-radius:6px; letter-spacing:.03em; }
+  .BUY, .buy { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .SELL, .sell { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .hold { background:var(--chip); color:var(--muted); }
+  .trade { background:color-mix(in srgb, var(--accent) 18%, transparent); color:var(--accent); }
+  .feed { max-height:460px; overflow-y:auto; }
+  .item { padding:9px 0; border-bottom:1px solid var(--border); }
+  .item:last-child { border-bottom:0; }
+  .item .meta { color:var(--muted); font-size:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .item .r { margin-top:3px; }
+  .item .o { margin-top:3px; font-size:12px; color:var(--muted); }
+  .item .n { margin-top:3px; font-size:12px; color:var(--accent); }
+  .item .w { margin-top:3px; font-size:12px; color:var(--muted); }
+  .item .e { margin-top:3px; font-size:12px; color:var(--red); }
+  .item details.think { margin-top:4px; font-size:12px; }
+  .item details.think summary { cursor:pointer; color:var(--muted); }
+  .item details.think div { margin-top:4px; padding:8px; background:var(--chip); border-radius:8px; color:var(--muted); white-space:pre-wrap; max-height:260px; overflow-y:auto; }
+  .empty { color:var(--muted); padding:16px 0; text-align:center; }
+  .rules { color:var(--muted); font-size:12px; }
+  .chip { display:inline-block; font-size:11px; font-weight:600; padding:1px 7px; border-radius:999px;
+          background:var(--chip); color:var(--muted); margin:0 4px 4px 0; }
+  .chip.tag { color:var(--accent); }
+  .fng { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
+  .fng .num { font-size:30px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .fng .bar { flex:1; height:8px; border-radius:99px; position:relative;
+              background:linear-gradient(90deg, var(--red), var(--price), var(--green)); }
+  .fng .bar i { position:absolute; top:-4px; width:4px; height:16px; background:var(--text); border-radius:2px; transform:translateX(-2px); }
+  .cfgline { font-size:12px; color:var(--muted); background:var(--chip); padding:3px 10px; border-radius:999px; }
+  .form { display:grid; gap:10px; }
+  .form label { display:grid; gap:4px; font-size:12px; color:var(--muted); }
+  .form input { font:inherit; font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid var(--border);
+                background:var(--bg); color:var(--text); width:100%; }
+  .form input:focus-visible, .btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .btn { font:inherit; font-size:14px; font-weight:600; padding:9px 14px; border-radius:8px; cursor:pointer;
+         border:1px solid var(--border); background:var(--panel); color:var(--text); }
+  .btn.danger { background:var(--red); border-color:var(--red); color:#fff; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .smsg { margin-top:8px; font-size:12px; color:var(--muted); min-height:1.4em; }
+  .smsg.err { color:var(--red); }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  .modal[hidden] { display:none; }
+  .modal .box { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:20px; max-width:420px; width:100%; }
+  .modal h3 { margin:0 0 8px; font-size:16px; }
+  .modal p { margin:0 0 6px; color:var(--muted); }
+  .modal .row { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+  .running { background:color-mix(in srgb, var(--green) 18%, transparent); color:var(--green); }
+  .died { background:color-mix(in srgb, var(--red) 18%, transparent); color:var(--red); }
+  .ended { background:var(--chip); color:var(--muted); }
+  .news a { color:var(--text); text-decoration:none; }
+  .news a:hover { text-decoration:underline; }
+  .news .meta { color:var(--muted); font-size:12px; margin-top:2px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title">LLM Trading Arena</h1>
+    <span id="status" class="pill alive">…</span>
+    <span id="sub" class="sub"></span>
+    <span id="cfgline" class="cfgline"></span>
+    <span id="conn" class="conn">Connecting…</span>
+  </header>
+
+  <div class="cards">
+    <div class="card"><div class="k">Total value</div><div class="v" id="c-eq">–</div><div class="s" id="c-eq-s"></div></div>
+    <div class="card"><div class="k">Profit / loss</div><div class="v" id="c-pl">–</div><div class="s" id="c-pl-s"></div></div>
+    <div class="card"><div class="k">Cash</div><div class="v" id="c-cash">–</div><div class="s" id="c-cash-s"></div></div>
+    <div class="card"><div class="k">Coins held</div><div class="v" id="c-coins">–</div><div class="s" id="c-coins-s"></div></div>
+    <div class="card"><div class="k">Fear &amp; Greed</div><div class="v" id="c-fng">–</div><div class="s" id="c-fng-s"></div></div>
+    <div class="card"><div class="k">Turns survived</div><div class="v" id="c-turns">–</div><div class="s" id="c-turns-s"></div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Money over time <span id="rules" class="rules"></span></h2>
+    <div class="chartbox"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="grid3">
+    <div class="panel">
+      <h2>Holdings <span id="hnote"></span></h2>
+      <div class="tablewrap" style="max-height:260px">
+        <table>
+          <thead><tr><th>Coin</th><th>Qty</th><th>Avg cost</th><th>Price</th><th>Value</th><th>P/L</th></tr></thead>
+          <tbody id="holds"><tr><td colspan="6" class="empty">No coins held</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Allocation</h2>
+      <div class="donutbox"><canvas id="donut"></canvas></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>Trades <span id="tcount"></span></h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Time</th><th>Turn</th><th>Coin</th><th>Action</th><th>Qty</th><th>Price</th><th>Value</th><th>Fee</th><th>Cash after</th><th>Why</th></tr></thead>
+          <tbody id="trades"><tr><td colspan="10" class="empty">No trades yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Its thoughts <span>latest decisions</span></h2>
+      <div class="feed" id="feed"><div class="empty">Waiting for the first turn…</div></div>
+    </div>
+  </div>
+
+  <div class="grid3">
+    <div class="panel">
+      <h2>Past lives <span id="lcount"></span></h2>
+      <div class="tablewrap" style="max-height:260px">
+        <table>
+          <thead><tr><th>#</th><th>Started</th><th>Start cash</th><th>Fee</th><th>Turns</th><th>Final value</th><th>Status</th></tr></thead>
+          <tbody id="lives"><tr><td colspan="7" class="empty">No lives yet</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel" id="settings">
+      <h2>Settings <span>apply to the next life</span></h2>
+      <div class="form">
+        <label>Starting amount ($), 1 to 100000<input id="s-cash" type="number" min="1" max="100000" step="any" inputmode="decimal"></label>
+        <label>Fee (%) on every buy and sell, 0 to 5<input id="s-fee" type="number" min="0" max="5" step="0.01" inputmode="decimal"></label>
+        <button id="s-restart" class="btn danger" type="button">Restart agent</button>
+      </div>
+      <div id="s-msg" class="smsg" role="status"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>News &amp; mood <span id="mnote"></span></h2>
+    <div class="fng" id="fngbox"></div>
+    <div id="trend" style="margin-bottom:10px"></div>
+    <div class="feed news" id="news"><div class="empty">No headlines yet</div></div>
+  </div>
+</div>
+
+<div id="modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="m-title">
+  <div class="box">
+    <h3 id="m-title">Restart the agent?</h3>
+    <p>This ends the current life and starts a new one with these settings.</p>
+    <p id="m-detail" style="color:var(--text);font-weight:600"></p>
+    <p>The current life is archived and stays in Past lives.</p>
+    <div class="row">
+      <button id="m-cancel" class="btn" type="button">Cancel</button>
+      <button id="m-ok" class="btn danger" type="button">Restart agent</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const money = x => (x < 0 ? '-' : '') + '$' + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+const pricef = p => p >= 1000 ? p.toLocaleString(undefined, {maximumFractionDigits:0}) : p >= 1 ? p.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:3}) : Number(p).toPrecision(4);
+const qtyf = q => q === 0 ? '0' : Number(q).toPrecision(4);
+const tfmt = ts => new Date(ts).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+const tshort = ts => new Date(ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cssv = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const signCls = x => x >= 0 ? 'pos' : 'neg';
+const base = s => String(s).replace(/USDT$/, '');
+const ago = ts => { const s = (Date.now() - new Date(ts)) / 1000; return s < 3600 ? Math.max(1, Math.floor(s/60)) + 'm ago' : s < 86400 ? Math.floor(s/3600) + 'h ago' : Math.floor(s/86400) + 'd ago'; };
+const safeUrl = u => /^https?:\/\//i.test(u) ? u : '#';
+
+let chart = null, donut = null;
+function initCharts() {
+  if (typeof Chart === 'undefined') {
+    $('.chartbox').innerHTML = '<div class="empty">Chart library didn\'t load (no internet?). Tables still update.</div>';
+    $('.donutbox').innerHTML = '';
+    return;
+  }
+  chart = new Chart($('#chart'), {
+    type: 'line',
+    data: { labels: [], datasets: [
+      { label: 'Total value ($)', data: [], borderColor: cssv('--accent'), borderWidth: 2, tension: .2,
+        pointRadius: [], pointBackgroundColor: [], pointBorderColor: [] },
+      { label: 'BTC buy & hold', data: [], borderColor: cssv('--price'), borderWidth: 1.5, pointRadius: 0, tension: .2 },
+      { label: 'Starting cash', data: [], borderColor: cssv('--muted'), borderDash: [4,4], borderWidth: 1, pointRadius: 0 },
+    ]},
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: cssv('--muted'), boxWidth: 12, boxHeight: 2 } },
+        tooltip: { callbacks: { label: c => ` ${c.dataset.label}: ${money(c.parsed.y)}` } },
+      },
+      scales: {
+        x: { ticks: { color: cssv('--muted'), maxTicksLimit: 6, maxRotation: 0 }, grid: { display: false } },
+        y: { ticks: { color: cssv('--muted'), callback: v => '$' + v }, grid: { color: cssv('--border') } },
+      },
+    },
+  });
+  donut = new Chart($('#donut'), {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], borderWidth: 1, borderColor: cssv('--panel') }] },
+    options: { animation: false, responsive: true, maintainAspectRatio: false, cutout: '62%',
+      plugins: { legend: { position: 'right', labels: { color: cssv('--muted'), boxWidth: 10, font: { size: 11 } } },
+                 tooltip: { callbacks: { label: c => ` ${c.label}: ${money(c.parsed)}` } } } },
+  });
+}
+
+const PALETTE = ['#4f46e5','#12a150','#d98a1a','#d92d20','#0ea5e9','#a855f7','#14b8a6','#ec4899','#84cc16','#f97316'];
+
+function renderChart(s) {
+  if (!chart) return;
+  const key = t => t.ts + '|' + t.action;
+  const buys = new Set(s.trades.filter(t => t.action === 'BUY').map(t => t.ts));
+  const sells = new Set(s.trades.filter(t => t.action === 'SELL').map(t => t.ts));
+  const g = cssv('--green'), r = cssv('--red'), a = cssv('--accent');
+  const ds = chart.data.datasets;
+  const btc0 = s.equity.length ? s.equity[0].btc_price : null;
+  chart.data.labels = s.equity.map(e => tshort(e.ts));
+  ds[0].data = s.equity.map(e => e.equity);
+  ds[0].pointRadius = s.equity.map(e => buys.has(e.ts) || sells.has(e.ts) ? 4 : 0);
+  // a turn with both buy and sell shows red
+  ds[0].pointBackgroundColor = s.equity.map(e => sells.has(e.ts) ? r : buys.has(e.ts) ? g : a);
+  ds[0].pointBorderColor = ds[0].pointBackgroundColor;
+  ds[1].data = s.equity.map(e => btc0 && e.btc_price ? s.config.start_cash * e.btc_price / btc0 : null);
+  ds[2].data = s.equity.map(() => s.config.start_cash);
+  chart.update();
+}
+
+function renderDonut(s) {
+  if (!donut) return;
+  const items = [['Cash', s.bot.cash], ...s.holdings.map(h => [base(h.symbol), h.value])].filter(x => x[1] > 0.005);
+  donut.data.labels = items.map(x => x[0]);
+  donut.data.datasets[0].data = items.map(x => x[1]);
+  donut.data.datasets[0].backgroundColor = items.map((x, i) => x[0] === 'Cash' ? cssv('--muted') : PALETTE[i % PALETTE.length]);
+  donut.update();
+}
+
+function render(s) {
+  const b = s.bot, c = s.config, eq = s.equity_now;
+  const pl = eq - c.start_cash, plp = pl / c.start_cash * 100;
+  document.title = `${b.name} ${money(eq)} · LLM Trading Arena`;
+  $('#title').textContent = b.name;
+  const st = $('#status');
+  st.textContent = b.alive ? 'ALIVE' : 'DEAD';
+  st.className = 'pill ' + (b.alive ? 'alive' : 'dead');
+  $('#sub').textContent = `${b.model} · free choice of ${c.universe_size} coins`;
+  $('#rules').textContent = `start ${money(c.start_cash)} · fee ${(c.fee_rate*100).toFixed(2)}% · dies below ${money(c.death_line)}` +
+    (c.living_cost > 0 ? ` · living cost ${money(c.living_cost)}/turn` : '');
+
+  $('#c-eq').textContent = money(eq);
+  $('#c-eq-s').textContent = `${money(eq - c.death_line)} above death`;
+  $('#c-pl').textContent = (pl >= 0 ? '+' : '') + money(pl);
+  $('#c-pl').className = 'v ' + signCls(pl);
+  let bh = '';
+  if (s.equity.length && s.equity[0].btc_price && s.btc_price) {
+    const btcp = (s.btc_price / s.equity[0].btc_price - 1) * 100;
+    bh = ` · BTC hold <span class="${signCls(btcp)}">${btcp >= 0 ? '+' : ''}${btcp.toFixed(2)}%</span>`;
+  }
+  $('#c-pl-s').innerHTML = `${plp >= 0 ? '+' : ''}${plp.toFixed(2)}% vs start${bh}`;
+  $('#c-cash').textContent = money(b.cash);
+  $('#c-cash-s').textContent = `fees paid ${money(s.fees_paid)}`;
+  $('#c-coins').textContent = s.holdings.length;
+  $('#c-coins-s').textContent = s.holdings.length ? s.holdings.slice(0, 3).map(h => base(h.symbol)).join(', ') : 'all cash';
+  const f = s.mood.fng;
+  $('#c-fng').textContent = f ? f.value : 'n/a';
+  $('#c-fng-s').textContent = f ? f.label : 'unavailable';
+  $('#c-turns').textContent = b.ticks;
+  const avg = c.avg_turn_seconds ? `avg turn ${c.avg_turn_seconds.toFixed(0)}s · ` : '';
+  $('#c-turns-s').textContent = b.alive ? `${avg}every ${c.interval}s` : `died ${tfmt(b.died)}`;
+
+  $('#hnote').textContent = s.holdings.length ? `${money(s.holdings.reduce((a, h) => a + h.value, 0))} in coins` : '';
+  $('#holds').innerHTML = s.holdings.length ? s.holdings.map(h => `
+    <tr><td><b>${esc(base(h.symbol))}</b></td><td>${qtyf(h.qty)}</td><td>${pricef(h.avg_cost)}</td>
+    <td>${pricef(h.price)}</td><td>${money(h.value)}</td>
+    <td class="${signCls(h.pl_pct)}">${h.pl_pct >= 0 ? '+' : ''}${h.pl_pct.toFixed(2)}%</td></tr>`).join('')
+    : '<tr><td colspan="6" class="empty">No coins held</td></tr>';
+
+  $('#tcount').textContent = `${s.trade_count} total`;
+  $('#trades').innerHTML = s.trades.length ? s.trades.map(t => `
+    <tr>
+      <td>${tfmt(t.ts)}</td><td>${t.turn}</td><td><b>${esc(base(t.symbol))}</b></td>
+      <td><span class="badge ${esc(t.action)}">${esc(t.action)}</span></td>
+      <td>${qtyf(t.qty)}</td><td>${pricef(t.price)}</td><td>${money(t.usd)}</td>
+      <td>${money(t.fee)}</td><td>${money(t.cash_after)}</td>
+      <td class="reason">${esc(t.reason)}</td>
+    </tr>`).join('') : '<tr><td colspan="10" class="empty">No trades yet</td></tr>';
+
+  $('#feed').innerHTML = s.decisions.length ? s.decisions.map(d => {
+    let watch = []; try { watch = JSON.parse(d.watch || '[]'); } catch (e) {}
+    const rej = d.error && /REJECTED|NOTE:/.test(d.error);
+    return `
+    <div class="item">
+      <div class="meta"><span class="badge ${esc(d.action)}">${esc(d.action.toUpperCase())}</span>turn ${d.turn} · ${tfmt(d.ts)}
+        ${d.prompt_tokens ? `· ${d.prompt_tokens}+${d.eval_tokens} tok` : ''}${d.duration ? ` · ${d.duration.toFixed(0)}s` : ''}</div>
+      ${d.reason ? `<div class="r">${esc(d.reason)}</div>` : ''}
+      ${d.orders && d.orders !== 'none' ? `<div class="o">Orders asked: ${esc(d.orders)}</div>` : ''}
+      ${watch.length ? `<div class="w">Watching: ${watch.map(w => esc(base(w))).join(', ')}</div>` : ''}
+      ${d.note ? `<div class="n">Note to self: ${esc(d.note)}</div>` : ''}
+      ${d.error ? `<div class="e">${rej ? '' : 'Error: '}${esc(d.error)}</div>` : ''}
+      ${d.thinking ? `<details class="think"><summary>Show reasoning</summary><div>${esc(d.thinking)}</div></details>` : ''}
+    </div>`;
+  }).join('') : '<div class="empty">Waiting for the first turn…</div>';
+
+  const fg = s.mood.fng;
+  $('#fngbox').innerHTML = fg ? `<div class="num">${fg.value}</div><div><div>${esc(fg.label)}</div><div class="sub">Fear &amp; Greed index</div></div>
+    <div class="bar"><i style="left:${fg.value}%"></i></div>` : '<div class="sub">Fear &amp; Greed unavailable</div>';
+  $('#trend').innerHTML = s.mood.trending ? '<span class="sub">Trending on CoinGecko: </span>' +
+    s.mood.trending.map(t => `<span class="chip">${esc(t.symbol)}</span>`).join('') : '<span class="sub">Trending unavailable</span>';
+  $('#mnote').textContent = `${s.news.length} recent headlines`;
+  $('#news').innerHTML = s.news.length ? s.news.map(n => `
+    <div class="item"><a href="${esc(safeUrl(n.link))}" target="_blank" rel="noopener noreferrer">${esc(n.title)}</a>
+      <div class="meta">${esc(n.source)} · ${ago(n.published)} ${(n.tags || '').split(',').filter(Boolean).map(t => `<span class="chip tag">${esc(t)}</span>`).join('')}</div>
+    </div>`).join('') : '<div class="empty">No headlines yet</div>';
+
+  renderChart(s);
+  renderDonut(s);
+}
+
+// ── settings + restart ──
+let dirty = false, restarting = false;
+const numStr = x => String(Math.round(x * 10000) / 10000);
+
+function renderSettings(s) {
+  const c = s.config;
+  $('#cfgline').textContent = `Start ${money(c.start_cash).replace(/\.00$/, '')} · Fee ${(c.fee_rate * 100).toFixed(2)}%`;
+  const typing = document.activeElement && document.activeElement.closest('#settings');
+  if (!dirty && !typing) {
+    $('#s-cash').value = numStr(s.settings.start_cash);
+    $('#s-fee').value = numStr(s.settings.fee_pct);
+  }
+  const pending = !!s.restart_pending;
+  $('#s-restart').disabled = pending || restarting;
+  if (pending) setMsg('Restart queued: the new life starts as soon as the current turn finishes.');
+  else if (restarting) { restarting = false; setMsg('New life started.'); }
+}
+
+function setMsg(text, err) { const m = $('#s-msg'); m.textContent = text; m.className = 'smsg' + (err ? ' err' : ''); }
+
+function readSettings() {
+  const cash = parseFloat($('#s-cash').value), fee = parseFloat($('#s-fee').value);
+  if (!isFinite(cash) || cash < 1 || cash > 100000) return { error: 'Starting amount must be between 1 and 100000.' };
+  if (!isFinite(fee) || fee < 0 || fee > 5) return { error: 'Fee must be between 0 and 5 percent.' };
+  return { start_cash: cash, fee_pct: fee };
+}
+
+let lastFocus = null;
+function openModal() {
+  const v = readSettings();
+  if (v.error) { setMsg(v.error, true); return; }
+  setMsg('');
+  $('#m-detail').textContent = `Start ${money(v.start_cash).replace(/\.00$/, '')} · Fee ${v.fee_pct}%`;
+  lastFocus = document.activeElement;
+  $('#modal').hidden = false;
+  $('#m-cancel').focus();
+}
+function closeModal() { $('#modal').hidden = true; if (lastFocus) lastFocus.focus(); }
+
+async function confirmRestart() {
+  const v = readSettings();
+  if (v.error) { closeModal(); setMsg(v.error, true); return; }
+  closeModal();
+  $('#s-restart').disabled = true;
+  try {
+    const res = await fetch('/api/restart', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(v) });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { setMsg(body.error || `Restart failed (${res.status}).`, true); $('#s-restart').disabled = false; return; }
+    dirty = false; restarting = true;
+    setMsg('Restart queued: the new life starts as soon as the current turn finishes.');
+    refresh();
+  } catch (e) { setMsg('Could not reach the agent.', true); $('#s-restart').disabled = false; }
+}
+
+$('#s-cash').addEventListener('input', () => { dirty = true; });
+$('#s-fee').addEventListener('input', () => { dirty = true; });
+$('#s-restart').addEventListener('click', openModal);
+$('#m-cancel').addEventListener('click', closeModal);
+$('#m-ok').addEventListener('click', confirmRestart);
+$('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+document.addEventListener('keydown', e => {
+  if ($('#modal').hidden) return;
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Tab') {                                   // keep focus inside the dialog
+    const f = [$('#m-cancel'), $('#m-ok')], i = f.indexOf(document.activeElement);
+    e.preventDefault(); f[(i + (e.shiftKey ? f.length - 1 : 1)) % f.length].focus();
+  }
+});
+
+function renderLives(runs) {
+  $('#lcount').textContent = `${runs.length} total`;
+  $('#lives').innerHTML = runs.length ? runs.map(r => {
+    const pl = (r.final_value / r.start_cash - 1) * 100;
+    return `<tr><td>${r.id}</td><td>${tfmt(r.started)}</td><td>${money(r.start_cash)}</td><td>${Number(r.fee_pct).toFixed(2)}%</td>
+      <td>${r.turns}</td><td>${money(r.final_value)} <span class="${signCls(pl)}">(${pl >= 0 ? '+' : ''}${pl.toFixed(1)}%)</span></td>
+      <td><span class="badge ${esc(r.status)}">${esc(r.status.toUpperCase())}</span></td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">No lives yet</td></tr>';
+}
+
+async function refresh() {
+  try {
+    const [res, rres] = await Promise.all([fetch('/api/state', { cache: 'no-store' }), fetch('/api/runs', { cache: 'no-store' })]);
+    const s = await res.json();
+    if (s.ready) { render(s); renderSettings(s); }
+    if (rres.ok) renderLives(await rres.json());
+    $('#conn').textContent = 'Live · updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('#conn').textContent = 'Disconnected. Is arena.py running?';
+  }
+}
+
+initCharts();
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

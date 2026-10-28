@@ -1,0 +1,14 @@
+# Coins the agent may never BUY (it can still sell what it holds). One symbol or base asset per line.
+# Tokenized stocks/ETFs are already excluded automatically via Binance exchangeInfo (permission group TRD_GRP_261);
+# this list is a manual backup and for anything else you want banned.
+MSTRB
+KORUB
+CRCLB
+SKHYB
+SNDKB
+SOXLB
+SPCXB
+MUB
+INTCB
+NVDAB
+GOOGLB
