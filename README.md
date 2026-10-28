@@ -6,9 +6,7 @@ A local language model (DeepSeek-R1 via [Ollama](https://ollama.com)) is handed 
 
 Everything runs on your own machine. No exchange account, no API keys, no paid services, no real orders.
 
-![Dashboard screenshot](docs/screenshot.png)
-
-<!-- Add a screenshot of the running dashboard at docs/screenshot.png -->
+![The live dashboard: total value against a BTC buy-and-hold benchmark, holdings and allocation](docs/screenshot/screenshot%201.png)
 
 > **Disclaimer.** This is a simulation for learning and entertainment. It is **not financial advice**, it never places real orders, and nothing it "decides" says anything about how a real strategy would perform. Small language models are not good traders.
 
@@ -20,6 +18,16 @@ Everything runs on your own machine. No exchange account, no API keys, no paid s
 - **Live dashboard.** Money vs. a "BTC buy and hold" benchmark, holdings and allocation, trades, news, past lives, and a collapsible "Show reasoning" for every decision. Light and dark mode, works on a phone.
 - **Settings and restart from the dashboard.** Change the starting amount and fee, restart, and keep every past life in the ledger.
 - **Standard library only.** One Python file plus one HTML file. No pip installs.
+
+## Screenshots
+
+Every trade with the agent's reason, its latest thoughts with a collapsible "Show reasoning", past lives with report and CSV export links, and the settings panel:
+
+![Trades table, the agent's thoughts, past lives and settings](docs/screenshot/screenshot%202.png)
+
+The news and market-mood panel: Fear & Greed, CoinGecko trending coins and the latest headlines tagged by coin:
+
+![News and market mood panel](docs/screenshot/screenshot%203.png)
 
 ## How it works
 
@@ -175,7 +183,7 @@ start-fresh.bat   Windows launcher (wipes the ledger)
 start.sh          macOS / Linux launcher
 skill/SKILL.md    a from-scratch build guide for this project
 legacy/           the original single-coin (BTC only) version
-docs/             put screenshot.png here
+docs/screenshot/  dashboard screenshots used in this README
 LICENSE           MIT
 arena.db          your ledger (created on first run, git-ignored)
 ```
